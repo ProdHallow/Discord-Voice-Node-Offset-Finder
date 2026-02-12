@@ -6,6 +6,24 @@
 ![Offsets](https://img.shields.io/badge/Offsets-18-5865F2?style=flat-square)
 ![Signatures](https://img.shields.io/badge/Signatures-8-00C853?style=flat-square)
 
+> **Full transparency:** I am not a Python developer... in fact i SUCK at python — I'm pretty good at ps1 and familiar with most of c++. The offset research, signature design, and binary analysis are a collection of My,Cypher,Shaun, and Oracle's determination; the actual Python implementation was written almost entirely by Claude (Anthropic). If the code is clean, that's Claude. If the signatures are clever, that's us. If something is broken, it's probably both of our faults lol!
+
+---
+
+## Credits
+
+**ProdHallow** - Reverse engineering, offset research, signature design, binary analysis, patch methodology, and telling Claude what to write
+
+**Cypher** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+
+**Shaun** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+
+**Oracle** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+
+**Claude (Anthropic)** — Python implementation, script architecture, documentation, and translating "patch the second cmov 31 bytes after the 48000/32000 mov pair" into working code
+
+**Cypher | Oracle | Shaun** —  Deserve a MASSIVE shoutout for the oginal offset discovery and research
+
 ---
 
 ## Table of Contents
