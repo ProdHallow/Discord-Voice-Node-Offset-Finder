@@ -22,7 +22,7 @@
 
 **Claude (Anthropic)** — Python implementation, script architecture, documentation, and translating "patch the second cmov 31 bytes after the 48000/32000 mov pair" into working code
 
-**Cypher | Oracle | Shaun** —  Deserve a MASSIVE shoutout for the oginal offset discovery and research
+**Cypher | Oracle | Shaun** —  Deserve a MASSIVE shoutout for the original offset discovery and research
 
 ---
 
