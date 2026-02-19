@@ -66,7 +66,7 @@ The offset finder locates 18 specific code locations inside Discord's native voi
 
 The tool is designed so that when Discord ships a new `discord_voice.node`, a developer can run it against the new binary. If all 18 offsets resolve, the existing patcher works as-is — just swap the offset table. If signatures break, the console output tells you exactly which ones failed and why, so you know where to focus your reverse engineering.
 
-The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Windows (PE), Linux (ELF), and macOS (Mach-O); it uses **9** anchor signatures to derive the same 18 offsets.
+The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Windows (PE), Linux (ELF), and macOS (Mach-O); it uses **9** anchor signatures to derive the same 18 offsets. **On current Discord builds, the finder resolves all 18 offsets on Windows, Linux, and macOS.**
 
 ---
 
@@ -347,7 +347,7 @@ On Windows, if no file path is provided, the script searches standard Discord in
 
 It picks the latest `app-*` directory (sorted descending) and the first matching voice module. This works for stock Discord; mod clients (BetterDiscord, Vencord, etc.) share the same install path.
 
-On non-Windows platforms, auto-detection is not supported — pass the path explicitly.
+**Auto-detection of the install path is Windows-only.** On Linux and macOS, pass the path to `discord_voice.node` explicitly. **Offset discovery itself is cross-platform:** the finder resolves all 18 offsets on current builds on Windows, Linux, and macOS when given the binary.
 
 ---
 
@@ -452,5 +452,7 @@ When Discord ships a new `discord_voice.node`:
 - **No cross-reference analysis.** The tool doesn't trace callers or data flow. If Discord restructures how functions are called (e.g., inlining the downmixer), the offsets might resolve but the patches might not have the desired effect.
 
 - **No ASLR handling.** The tool works with file offsets / RVAs, not runtime virtual addresses. The patcher handles ASLR via `GetModuleHandle` at runtime.
+
+- **Auto-detection is Windows-only.** Only the automatic search for the binary path is limited to Windows. Given the path to `discord_voice.node`, the finder finds all 18 offsets on Windows, Linux, and macOS.
 
 - **Disambiguator fragility.** Some signatures use disambiguator callbacks to choose among multiple pattern matches. Those callbacks rely on nearby instruction patterns; if the compiler restructures the code, a disambiguator can fail even when the signature still matches. Updating the disambiguator or tightening the signature in the script fixes it.
