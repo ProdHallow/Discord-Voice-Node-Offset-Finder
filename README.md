@@ -451,8 +451,6 @@ When Discord ships a new `discord_voice.node`:
 
 - **No cross-reference analysis.** The tool doesn't trace callers or data flow. If Discord restructures how functions are called (e.g., inlining the downmixer), the offsets might resolve but the patches might not have the desired effect.
 
-- **Windows auto-detection only.** macOS and Linux Discord installs use different paths and potentially different binary formats (though the voice module is typically the same PE64 binary on all platforms via Electron).
-
 - **No ASLR handling.** The tool works with file offsets / RVAs, not runtime virtual addresses. The patcher handles ASLR via `GetModuleHandle` at runtime.
 
 - **Disambiguator fragility.** Some signatures use disambiguator callbacks to choose among multiple pattern matches. Those callbacks rely on nearby instruction patterns; if the compiler restructures the code, a disambiguator can fail even when the signature still matches. Updating the disambiguator or tightening the signature in the script fixes it.
