@@ -21,7 +21,7 @@ import contextlib
 VERSION = "1.0.0"
 SCRIPT_DIR = Path(__file__).parent
 
-# ─── Theme Colors (matching Stereo Installer) ────────────────────────
+# --- Theme Colors (matching Stereo Installer) ---------------------------------
 BG           = "#1e1e1e"
 BG_LIGHT     = "#2d2d2d"
 BG_INPUT     = "#1a1a1a"
@@ -68,7 +68,7 @@ class OffsetFinderGUI:
         self._build_ui()
         self._load_finder()
 
-    # ─── UI Construction ──────────────────────────────────────────
+    # --- UI Construction -----------------------------------------------------
     def _build_ui(self):
         # Title area
         title_frame = tk.Frame(self.root, bg=BG)
@@ -81,7 +81,7 @@ class OffsetFinderGUI:
         tk.Label(title_frame, text=f"v{VERSION}",
                  font=("Segoe UI", 8), bg=BG, fg=FG_DIM).pack()
 
-        # ─── Binary Selection Group ───
+        # --- Binary Selection Group ---
         sel_frame = tk.LabelFrame(self.root, text=" Binary Selection ",
                                   font=("Segoe UI", 9, "bold"),
                                   bg=BG_LIGHT, fg=FG, bd=1, relief="groove",
@@ -114,14 +114,14 @@ class OffsetFinderGUI:
                                    highlightbackground=BORDER, highlightthickness=1)
         self.file_entry.pack(side="left", fill="x", expand=True, padx=(4, 6), ipady=3)
 
-        self.browse_btn = tk.Button(file_row, text="Browse…",
+        self.browse_btn = tk.Button(file_row, text="Browse...",
                                     font=("Segoe UI", 9), bg=GRAY_BTN, fg=FG,
                                     activebackground=GRAY_HOVER, activeforeground=FG,
                                     relief="flat", bd=0, padx=12, pady=2,
                                     cursor="hand2", command=self._browse_file)
         self.browse_btn.pack(side="right")
 
-        # ─── Options Group ───
+        # --- Options Group ---
         opt_frame = tk.LabelFrame(self.root, text=" Options ",
                                   font=("Segoe UI", 9, "bold"),
                                   bg=BG_LIGHT, fg=FG, bd=1, relief="groove",
@@ -154,7 +154,7 @@ class OffsetFinderGUI:
                                 bd=0, anchor="w")
             cb.pack(anchor="w", pady=1)
 
-        # ─── Output Area ───
+        # --- Output Area ---
         output_frame = tk.Frame(self.root, bg=BG)
         output_frame.pack(fill="both", expand=True, padx=16, pady=(10, 0))
 
@@ -172,7 +172,7 @@ class OffsetFinderGUI:
         self.output.tag_config("header", foreground=ORANGE, font=("Consolas", 9, "bold"))
         self.output.tag_config("success", foreground=GREEN, font=("Consolas", 10, "bold"))
 
-        # ─── Status Bar ───
+        # --- Status Bar ---
         status_frame = tk.Frame(self.root, bg=BG_LIGHT, height=24)
         status_frame.pack(fill="x", padx=16, pady=(6, 0))
         self.status_label = tk.Label(status_frame, textvariable=self.status_var,
@@ -180,7 +180,7 @@ class OffsetFinderGUI:
                                      anchor="w")
         self.status_label.pack(fill="x", padx=6, pady=2)
 
-        # ─── Button Bar ───
+        # --- Button Bar ---
         btn_frame = tk.Frame(self.root, bg=BG)
         btn_frame.pack(fill="x", padx=16, pady=(8, 14))
 
@@ -220,7 +220,7 @@ class OffsetFinderGUI:
         btn.bind("<Leave>", lambda e, b=btn, c=bg_color: b.configure(bg=c))
         return btn
 
-    # ─── Actions ──────────────────────────────────────────────────
+    # --- Actions -------------------------------------------------------------
     def _browse_file(self):
         path = filedialog.askopenfilename(
             title="Select discord_voice.node",
@@ -288,7 +288,7 @@ class OffsetFinderGUI:
                 f.write(text)
             self.status_var.set(f"Saved to {path}")
 
-    # ─── Finder Integration ───────────────────────────────────────
+    # --- Finder Integration --------------------------------------------------
     def _load_finder(self):
         """Dynamically import the offset finder script from same directory."""
         finder_path = None
@@ -345,7 +345,7 @@ class OffsetFinderGUI:
         fname = os.path.basename(path)
         self._append_output(f"  File: {fname}\n", "header")
         self._append_output(f"  Size: {fsize:,} bytes | OS: {self.os_var.get()}\n", "info")
-        self._append_output(f"  {'─' * 55}\n\n", "info")
+        self._append_output(f"  {'-' * 55}\n\n", "info")
 
         # Run in background thread
         thread = threading.Thread(target=self._run_finder_thread, args=(path,), daemon=True)
@@ -409,7 +409,7 @@ class OffsetFinderGUI:
             # Summary
             total = 18
             found = len(results)
-            self._append_output_safe(f"\n  {'═' * 55}\n", "header")
+            self._append_output_safe(f"\n  {'=' * 55}\n", "header")
             if found == total:
                 self._append_output_safe(
                     f"  [OK] ALL {found} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
@@ -478,6 +478,39 @@ class OffsetFinderGUI:
             except Exception:
                 sys.stdout = old_stdout
 
+            # Platform-specific copy-paste block for the matching patcher
+            file_size = len(data)
+            if fmt == "pe" and hasattr(mod, "format_windows_patcher_block"):
+                block = mod.format_windows_patcher_block(results, bin_info, path, file_size)
+                if block:
+                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                    self._append_output_safe("  COPY BELOW -> Discord_voice_node_patcher.ps1\n", "header")
+                    self._append_output_safe("  Replace the entire # region Offsets ... # endregion section\n", "info")
+                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    self._append_output_safe("--- BEGIN COPY (Windows) ---\n", None)
+                    self._append_output_safe(block + "\n", None)
+                    self._append_output_safe("--- END COPY ---\n\n", None)
+            elif fmt == "elf" and hasattr(mod, "format_linux_patcher_block"):
+                block = mod.format_linux_patcher_block(results, bin_info, path, file_size)
+                if block:
+                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                    self._append_output_safe("  COPY BELOW -> discord_voice_patcher_linux.sh\n", "header")
+                    self._append_output_safe("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section\n", "info")
+                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    self._append_output_safe("--- BEGIN COPY (Linux) ---\n", None)
+                    self._append_output_safe(block + "\n", None)
+                    self._append_output_safe("--- END COPY ---\n\n", None)
+            elif fmt == "macho" and hasattr(mod, "format_macos_patcher_block"):
+                block = mod.format_macos_patcher_block(results, bin_info, path, file_size)
+                if block:
+                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                    self._append_output_safe("  COPY BELOW -> discord_voice_patcher_macos.sh\n", "header")
+                    self._append_output_safe("  Replace the declare -A OFFSETS and comment block (x86_64)\n", "info")
+                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    self._append_output_safe("--- BEGIN COPY (macOS) ---\n", None)
+                    self._append_output_safe(block + "\n", None)
+                    self._append_output_safe("--- END COPY ---\n\n", None)
+
             # Save JSON if requested
             if self.save_json.get():
                 try:
@@ -507,7 +540,7 @@ class OffsetFinderGUI:
         self.running = False
         self.run_btn.configure(state="normal", bg=GREEN)
 
-    # ─── Thread-safe output helpers ───────────────────────────────
+    # --- Thread-safe output helpers ------------------------------------------
     def _append_output(self, text, tag=None):
         self.output.configure(state="normal")
         if tag:

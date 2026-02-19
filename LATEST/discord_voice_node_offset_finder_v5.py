@@ -1469,12 +1469,17 @@ def _arm64_scan_within_function(data, func_start, func_size, scan_type, adj):
 
     if scan_type == "arm64_bitrate_modified":
         # In CommitAudioCodec: find MOVZ wN, #32000, or if absent, find
-        # MOVZ wN, #2 (channel override for bitrate path).
+        # 32000 in literal pool (compiler may use ADRP+LDR instead of MOVZ).
         for i in range(0, flen - 4, 4):
             raw = _read32(func, i)
             if _is_movz_w(raw, 32000):
                 return func_start + i + adj
-        # Fallback: 32000 may not appear as MOVZ in this function
+        # Fallback: scan for 32-bit literal 0x00007D00 (32000) in function + literal pool
+        literal_32000 = struct.pack('<I', 32000)
+        search_end = min(func_start + flen + 2048, len(data) - 4)
+        for i in range(func_start, search_end - 3):
+            if data[i:i + 4] == literal_32000:
+                return i + adj
         return None
 
     if scan_type == "arm64_bitrate_const":
@@ -1587,7 +1592,8 @@ def _arm64_scan_within_function(data, func_start, func_size, scan_type, adj):
 
     if scan_type == "arm64_dup_bitrate_modified":
         # DuplicateEmulateBitrateModified: second occurrence of MOVZ wN, #32000
-        # in CommitAudioCodec (first is EmulateBitrateModified).
+        # in CommitAudioCodec (first is EmulateBitrateModified). If compiler uses
+        # literal pool, find second 32-bit literal 0x00007D00 in function + pool.
         count = 0
         for i in range(0, flen - 4, 4):
             raw = _read32(func, i)
@@ -1595,6 +1601,17 @@ def _arm64_scan_within_function(data, func_start, func_size, scan_type, adj):
                 count += 1
                 if count == 2:
                     return func_start + i + adj
+        # Fallback: second occurrence of 32000 literal in function + literal pool
+        literal_32000 = struct.pack('<I', 32000)
+        search_end = min(func_start + flen + 2048, len(data) - 4)
+        occurrences = []
+        for i in range(func_start, search_end - 3):
+            if data[i:i + 4] == literal_32000:
+                occurrences.append(i)
+        if len(occurrences) >= 2:
+            return occurrences[1] + adj
+        if len(occurrences) == 1:
+            return occurrences[0] + adj
         return None
 
     return None
@@ -2191,6 +2208,36 @@ def discover_offsets_arm64(data, arm64_info):
         elif method == 'arm64-hint':
             print(f"  [HINT] {offset_name:45s} function '{safe_sym}' - scan did not match")
 
+    # Fallback: if EmulateBitrateModified or DuplicateEmulateBitrateModified still
+    # missing (compiler used literal pool / no MOVZ), scan entire arm64 slice for
+    # 32-bit literal 32000 (0x00007D00) and assign first/second to them.
+    bitrate_missing = [n for n in ("EmulateBitrateModified", "DuplicateEmulateBitrateModified") if n not in results]
+    if bitrate_missing:
+        slice_start = fat_offset
+        slice_end = fat_offset + arm64_info.get('fat_size', 0)
+        if slice_end > len(data):
+            slice_end = len(data)
+        literal_32000 = struct.pack('<I', 32000)
+        orig_low3 = b'\x00\x7d\x00'  # low 3 bytes of 32000 (patch writes 00 D0 07)
+        candidates = []
+        for i in range(slice_start, slice_end - 4):
+            if data[i:i + 4] == literal_32000:
+                if data[i:i + 3] == orig_low3:
+                    candidates.append(i)
+        if candidates:
+            if "EmulateBitrateModified" in bitrate_missing and len(candidates) >= 1:
+                results["EmulateBitrateModified"] = candidates[0] + adj
+                tiers_used["EmulateBitrateModified"] = "arm64-literal-32000(1st)"
+                print(f"  [SCAN] {'EmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000]")
+            if "DuplicateEmulateBitrateModified" in bitrate_missing and len(candidates) >= 2:
+                results["DuplicateEmulateBitrateModified"] = candidates[1] + adj
+                tiers_used["DuplicateEmulateBitrateModified"] = "arm64-literal-32000(2nd)"
+                print(f"  [SCAN] {'DuplicateEmulateBitrateModified':45s} = 0x{candidates[1] + adj:X}  (file 0x{candidates[1]:X})  [literal 32000]")
+            elif "DuplicateEmulateBitrateModified" in bitrate_missing and len(candidates) == 1:
+                results["DuplicateEmulateBitrateModified"] = candidates[0] + adj
+                tiers_used["DuplicateEmulateBitrateModified"] = "arm64-literal-32000(only)"
+                print(f"  [SCAN] {'DuplicateEmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000 only]")
+
     # Report missing
     missing = [n for n in _all_offset_names() if n not in results]
     if missing:
@@ -2782,6 +2829,108 @@ def format_powershell_config(results, bin_info=None, file_path=None, file_size=N
     return "\n".join(lines)
 
 
+def format_windows_patcher_block(results, bin_info, file_path, file_size):
+    """Generate full Windows patcher offset region for copy-paste into Discord_voice_node_patcher.ps1.
+    Includes OffsetsMeta (Build, Size, MD5) and Offsets table. Values are config RVA for PE."""
+    if not bin_info or not file_path or file_size is None:
+        return None
+    fmt = bin_info.get('format', 'raw')
+    if fmt != 'pe':
+        return None
+    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
+    build_str = bin_info['build_time'].strftime('%b %d %Y') if 'build_time' in bin_info else 'PE binary'
+    lines = [
+        "# region Offsets (PASTE HERE)",
+        "#",
+        "# This patcher uses ONE offsets table.",
+        "# When Discord updates and your offset finder produces new values, paste them here.",
+        "#",
+        "# Tip: keep the MD5/Size in OffsetsMeta updated too. If it doesn't match the downloaded",
+        "# discord_voice.node, the script will stop early with a clear message instead of failing",
+        "# later with a confusing \"Binary validation failed\".",
+        "#",
+        "$Script:OffsetsMeta = @{",
+        f'    FinderVersion = "discord_voice_node_offset_finder.py v{VERSION}"',
+        f'    Build         = "{build_str}"',
+        f"    Size          = {file_size}",
+        f'    MD5           = "{md5}"',
+        "}",
+        "",
+        "$Script:Offsets = @{",
+    ]
+    ordered = _all_offset_names()
+    max_len = max(len(n) for n in ordered)
+    for name in ordered:
+        pad = " " * (max_len - len(name))
+        val = f"0x{results[name]:X}" if name in results else "0x0  # NOT FOUND"
+        lines.append(f"    {name}{pad} = {val}")
+    lines.append("}")
+    lines.append("")
+    lines.append("# endregion Offsets")
+    return "\n".join(lines)
+
+
+def format_linux_patcher_block(results, bin_info, file_path, file_size):
+    """Generate Linux patcher offset block for copy-paste into discord_voice_patcher_linux.sh.
+    Uses file offsets (ELF). Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section."""
+    if not bin_info or not file_path or file_size is None:
+        return None
+    fmt = bin_info.get('format', 'raw')
+    if fmt != 'elf':
+        return None
+    adj = bin_info.get('file_offset_adjustment', 0)
+    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
+    lines = [
+        "# --- Build fingerprint (update when targeting a new Discord build) ------------",
+        "# Run: python discord_voice_node_offset_finder_v5.py <path/to/discord_voice.node>",
+        "# Copy the \"COPY BELOW -> discord_voice_patcher_linux.sh\" block into this section.",
+        f'EXPECTED_MD5="{md5}"',
+        f"EXPECTED_SIZE={file_size}",
+        "",
+        "# --- Linux/ELF patch offsets --------------------------------------------------",
+    ]
+    ordered = _all_offset_names()
+    for name in ordered:
+        if name in results:
+            file_off = results[name] - adj
+            lines.append(f"OFFSET_{name}=0x{file_off:X}")
+        else:
+            lines.append(f"OFFSET_{name}=0x0  # NOT FOUND")
+    lines.append("FILE_OFFSET_ADJUSTMENT=0")
+    return "\n".join(lines)
+
+
+def format_macos_patcher_block(results, bin_info, file_path, file_size):
+    """Generate macOS patcher offset block for copy-paste into discord_voice_patcher_macos.sh.
+    Uses file offsets; for fat binary, offsets are fat_offset + slice offset (x86_64)."""
+    if not bin_info or not file_path or file_size is None:
+        return None
+    fmt = bin_info.get('format', 'raw')
+    if fmt != 'macho':
+        return None
+    adj = bin_info.get('file_offset_adjustment', 0)
+    fat_offset = bin_info.get('fat_offset', 0)
+    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
+    lines = [
+        "# macOS/Clang offsets - Auto-generated by discord_voice_node_offset_finder.py v" + VERSION,
+        f"# Build: MACHO binary | Size: {file_size} | MD5: {md5}",
+        "# Using file_offset values for direct binary patching (fat file offset when universal)",
+        "declare -A OFFSETS=(",
+    ]
+    ordered = _all_offset_names()
+    for name in ordered:
+        if name in results:
+            # File offset within slice; for fat binary, patcher needs offset in full file
+            slice_off = results[name] - adj
+            file_off = fat_offset + slice_off
+            lines.append(f"    [{name}]=0x{file_off:X}")
+        else:
+            lines.append(f"    [{name}]=0x0  # NOT FOUND")
+    lines.append(")")
+    lines.append("FILE_OFFSET_ADJUSTMENT=0")
+    return "\n".join(lines)
+
+
 def format_cpp_namespace(results):
     """Generate C++ namespace block for reference."""
     lines = ["namespace Offsets {"]
@@ -3222,17 +3371,43 @@ def main():
         print("=" * 65)
         print(ps_config)
 
-        # Windows (PE): explicit copy-paste block for Discord_voice_node_patcher.ps1
+        # Platform-specific copy-paste blocks for patchers
         if fmt == 'pe':
-            print("\n" + "=" * 65)
-            print("  COPY BELOW -> Discord_voice_node_patcher.ps1")
-            print("  Replace the # Auto-generated... comment block and Offsets = @{ ... } in Config")
-            print("=" * 65)
-            print("")
-            print("--- BEGIN COPY ---")
-            print(ps_config)
-            print("--- END COPY ---")
-            print("")
+            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
+            if win_block:
+                print("\n" + "=" * 65)
+                print("  COPY BELOW -> Discord_voice_node_patcher.ps1")
+                print("  Replace the entire # region Offsets ... # endregion Offsets section")
+                print("=" * 65)
+                print("")
+                print("--- BEGIN COPY (Windows) ---")
+                print(win_block)
+                print("--- END COPY ---")
+                print("")
+        elif fmt == 'elf':
+            linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
+            if linux_block:
+                print("\n" + "=" * 65)
+                print("  COPY BELOW -> discord_voice_patcher_linux.sh")
+                print("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section")
+                print("=" * 65)
+                print("")
+                print("--- BEGIN COPY (Linux) ---")
+                print(linux_block)
+                print("--- END COPY ---")
+                print("")
+        elif fmt == 'macho':
+            macos_block = format_macos_patcher_block(results, bin_info, file_path, file_size)
+            if macos_block:
+                print("\n" + "=" * 65)
+                print("  COPY BELOW -> discord_voice_patcher_macos.sh")
+                print("  Replace the declare -A OFFSETS and comment block (x86_64 slice)")
+                print("=" * 65)
+                print("")
+                print("--- BEGIN COPY (macOS) ---")
+                print(macos_block)
+                print("--- END COPY ---")
+                print("")
 
         # Non-PE: also show file offsets block
         if fmt != 'pe':
