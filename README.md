@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.6+-3776AB?style=flat-square)
 ![Offsets](https://img.shields.io/badge/Offsets-18-5865F2?style=flat-square)
-![Signatures](https://img.shields.io/badge/Signatures-8-00C853?style=flat-square)
+![Signatures](https://img.shields.io/badge/Signatures-9-00C853?style=flat-square)
 
 > **Full transparency:** I am not a Python developer... in fact i SUCK at python — I'm pretty good at ps1 and familiar with most of c++. The offset research, signature design, and binary analysis are a collection of My, Cypher, Shaun, and Oracle's determination; the actual Python implementation was written almost entirely by Claude (Anthropic). If the code is clean, that's Claude. If the signatures are clever, that's us. If something is broken, it's probably both of our faults lol!
 
@@ -14,11 +14,15 @@
 
 **ProdHallow** - Reverse engineering, offset research, signature design, binary analysis, patch methodology, and telling Claude what to write
 
-**Cypher** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+**Cypher** - Reverse engineering, offset research, signature design, binary analysis, patch methodology
 
-**Shaun** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+**Shaun** - Reverse engineering, offset research, signature design, binary analysis, patch methodology
 
-**Oracle** - Reverse engineering, offset research, signature design, binaru analysis, patch methodology
+**Oracle** - Reverse engineering, offset research, signature design, binary analysis, patch methodology
+
+**Crue** - Reverse engineering, offset research, signature design, binary analysis, patch methodology
+
+**Geeko** - Reverse engineering, offset research, signature design, binary analysis, patch methodology
 
 **Claude (Anthropic)** — Python implementation, script architecture, documentation, and translating "patch the second cmov 31 bytes after the 48000/32000 mov pair" into working code
 
@@ -31,20 +35,16 @@
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
+- [GUI](#gui)
 - [How It Works](#how-it-works)
   - [Phase 1: Signature Scanning](#phase-1-signature-scanning)
   - [Phase 1b: Patched Binary Fallbacks](#phase-1b-patched-binary-fallbacks)
   - [Phase 2: Relative Offset Derivation](#phase-2-relative-offset-derivation)
   - [Phase 3: Byte Verification](#phase-3-byte-verification)
   - [Phase 4: Injection Site Capacity](#phase-4-injection-site-capacity)
-- [The 18 Offsets](#the-18-offsets)
-  - [Offset Map](#offset-map)
-  - [Dependency Graph](#dependency-graph)
+- [Offsets (source of truth)](#offsets-source-of-truth)
 - [Signature Reference](#signature-reference)
   - [Signature Format](#signature-format)
-  - [Signature Catalogue](#signature-catalogue)
-  - [Disambiguators](#disambiguators)
-- [Derivation Reference](#derivation-reference)
 - [PE Layout & File Offset Adjustment](#pe-layout--file-offset-adjustment)
 - [Output Formats](#output-formats)
   - [Console Output](#console-output)
@@ -66,6 +66,8 @@ The offset finder locates 18 specific code locations inside Discord's native voi
 
 The tool is designed so that when Discord ships a new `discord_voice.node`, a developer can run it against the new binary. If all 18 offsets resolve, the existing patcher works as-is — just swap the offset table. If signatures break, the console output tells you exactly which ones failed and why, so you know where to focus your reverse engineering.
 
+The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Windows (PE), Linux (ELF), and macOS (Mach-O); it uses **9** anchor signatures to derive the same 18 offsets.
+
 ---
 
 ## Architecture
@@ -82,12 +84,12 @@ The tool is designed so that when Discord ships a new `discord_voice.node`, a de
 └──────────┬───────────────┘
            ▼
 ┌──────────────────────────┐     ┌──────────────────────┐
-│  Phase 1: Sig Scanner    │────▶│  8 anchor offsets    │
-│  (8 unique patterns)     │     └──────────┬───────────┘
+│  Phase 1: Sig Scanner    │────▶│  9 anchor offsets    │
+│  (9 unique patterns)     │     └──────────┬───────────┘
 └──────────────────────────┘                │
                                             ▼
 ┌──────────────────────────┐     ┌──────────────────────┐
-│  Phase 2: Derivation     │────▶│ +10 derived offsets  │
+│  Phase 2: Derivation     │────▶│ +9 derived offsets   │
 │  (anchor + delta)        │     └──────────┬───────────┘
 └──────────────────────────┘                │
                                             ▼
@@ -97,7 +99,7 @@ The tool is designed so that when Discord ships a new `discord_voice.node`, a de
 └──────────────────────────┘                │
                                             ▼
 ┌──────────────────────────┐     ┌──────────────────────┐
-│  Phase 4: Injection Check│────▶│ Capacity validation  │
+│  Phase 4: Injection Check │────▶│ Capacity validation  │
 │  (cc padding analysis)   │     └──────────┬───────────┘
 └──────────────────────────┘                │
                                             ▼
@@ -112,11 +114,13 @@ The tool is designed so that when Discord ships a new `discord_voice.node`, a de
 
 ```bash
 # Explicit path
-python discord_voice_node_offset_finder.py "C:\path\to\discord_voice.node"
+python discord_voice_node_offset_finder_v5.py "C:\path\to\discord_voice.node"
 
 # Auto-detect from Discord install (Windows only)
-python discord_voice_node_offset_finder.py
+python discord_voice_node_offset_finder_v5.py
 ```
+
+**GUI (optional):** Run `offset_finder_gui.py` from the same folder for a graphical interface (see [GUI](#gui)).
 
 The script requires only the Python standard library (no pip dependencies). Python 3.6+ is required.
 
@@ -129,11 +133,17 @@ The console stays open after completion (press Enter to close) so you can read t
 
 ---
 
+## GUI
+
+A graphical interface is provided by **`offset_finder_gui.py`** in the same directory. Run it (e.g. `python offset_finder_gui.py`) to select a `discord_voice.node` file, run the finder, and view colorized output. The GUI auto-loads the offset finder script from the same folder (e.g. `discord_voice_node_offset_finder_v5.py`) and uses a dark theme to match the Stereo Installer. Credits for the GUI: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher.
+
+---
+
 ## How It Works
 
 ### Phase 1: Signature Scanning
 
-The core of the tool. Eight hand-crafted byte patterns are scanned across the entire binary using a fast first-byte-skip algorithm:
+The core of the tool. Nine hand-crafted byte patterns are scanned across the entire binary using a fast first-byte-skip algorithm:
 
 1. For each signature, find the first non-wildcard byte
 2. Use Python's `bytes.find()` to jump to candidates (this is C-speed, not Python-loop-speed)
@@ -150,15 +160,7 @@ Each signature targets a **functionally unique** instruction sequence. Wildcards
 
 ### Phase 1b: Patched Binary Fallbacks
 
-If a signature fails (e.g., the binary is already patched), the tool attempts alternate detection:
-
-| Offset | Fallback Strategy |
-|--------|-------------------|
-| `MonoDownmixer` | Scan for the patched NOP sled pattern: `48 89 F9 E8 ?? ?? ?? ?? 90×12 E9` |
-| `SetsBitrateBitrateValue` | Scan for the NOPed `or rcx,rax`: `89 F8 48 B9 ??×8 90 90 90 48 89 4E 1C` |
-| `HighpassCutoffFilter` | Extract the target VA from the `HighPassFilter` redirect stub (`48 B8 <imm64> C3`) and subtract `image_base` |
-
-This means the tool works on both unpatched **and** already-patched binaries — useful for verifying a patch was applied correctly or for re-running after a gain change.
+If a signature fails (e.g., the binary is already patched), the tool may attempt alternate detection for some anchors (e.g. patched-byte patterns or redirect stubs). See the script for the current fallbacks. This allows the tool to work on both unpatched **and** already-patched binaries — useful for verifying a patch was applied correctly or for re-running after a gain change.
 
 ### Phase 2: Relative Offset Derivation
 
@@ -168,9 +170,7 @@ Nine of the 18 offsets are derived by adding a **fixed delta** to an anchor foun
 Derived Offset = Anchor Offset + Delta
 ```
 
-Example: `EmulateStereoSuccess2` is always exactly `+0xC` bytes after `EmulateStereoSuccess1` because they're two instructions apart in the same basic block.
-
-If an anchor wasn't found in Phase 1, all its dependents are skipped (not silently — the console reports `[SKIP] ... anchor not found`).
+Deltas are defined in the script and are stable when the derived site lives in the same function or compilation unit as the anchor. If an anchor wasn't found in Phase 1, all its dependents are skipped (not silently — the console reports `[SKIP] ... anchor not found`).
 
 ### Phase 3: Byte Verification
 
@@ -180,75 +180,25 @@ Every discovered offset is checked against `EXPECTED_ORIGINALS` — a table of w
 - **Already patched:** The bytes match the patcher's output instead of the original — reported as `[WARN] ALREADY PATCHED`
 - **Corruption:** Neither original nor patched bytes match
 
-Offsets with variable originals (like `EmulateBitrateModified` whose imul immediate depends on the build's default bitrate) are tagged `(no fixed expected)` and verified by structure rather than exact bytes.
+Offsets with variable expected bytes (e.g. bitrate-dependent immediates) are tagged `(no fixed expected)` and verified by structure rather than exact bytes.
 
 ### Phase 4: Injection Site Capacity
 
-Two offsets (`HighpassCutoffFilter` and `DcReject`) are **code injection sites** — the patcher overwrites the original function body with custom compiled C code. Phase 4 verifies there's enough room by scanning for `CC CC CC CC` (int3 padding) after the function start:
+Some offsets are **code injection sites** — the patcher overwrites the original function body with custom compiled C code. Phase 4 verifies there's enough room by scanning for `CC CC CC CC` (int3 padding) after the function start:
 
 ```
 Available = (first CC padding address) - (function start)
-Needed    = injection code size (0x100 for hp_cutoff, 0x1B6 for dc_reject)
+Needed    = injection code size (defined in the script)
 Margin    = Available - Needed
 ```
 
-If `Margin < 0`, the injection would overwrite the next function. This has never happened (margins are typically 200+ bytes), but the check exists as a safety net for future builds where the compiler might optimize these functions to be smaller.
+If `Margin < 0`, the injection would overwrite the next function. The check exists as a safety net for builds where the compiler might shrink these functions.
 
 ---
 
-## The 18 Offsets
+## Offsets (source of truth)
 
-### Offset Map
-
-| # | Name | Source | Patch Effect |
-|---|------|--------|--------------|
-| 1 | `EmulateStereoSuccess1` | Signature | Channel count `1` → `2` |
-| 2 | `EmulateStereoSuccess2` | Derived (1 + 0xC) | `jne` → `jmp` (force stereo path) |
-| 3 | `Emulate48Khz` | Derived (1 + 0x168) | `cmovb` → `NOP×3` (force 48kHz) |
-| 4 | `EmulateBitrateModified` | Derived (1 + 0x45F) | `imul` immediate → 512000 bps |
-| 5 | `SetsBitrateBitrateValue` | Signature | imm64 low bytes → 512000 |
-| 6 | `SetsBitrateBitwiseOr` | Derived (5 + 0x8) | `or rcx,rax` → `NOP×3` |
-| 7 | `HighPassFilter` | Derived (1 + 0xC275) | Redirect to `HighpassCutoffFilter` VA |
-| 8 | `CreateAudioFrameStereo` | Signature | `cmovae r13,rax` → `mov r13,rax; nop` |
-| 9 | `AudioEncoderOpusConfigSetChannels` | Signature | Channel count `1` → `2` in config struct |
-| 10 | `AudioEncoderOpusConfigIsOk` | Derived (9 + 0x29C) | Force `return 1` (always valid) |
-| 11 | `MonoDownmixer` | Signature | `NOP×12 + jmp` (skip mono downmix gate) |
-| 12 | `ThrowError` | Signature | `ret` at entry (disable error throws) |
-| 13 | `DownmixFunc` | Signature | `ret` at entry (disable downmix function) |
-| 14 | `HighpassCutoffFilter` | Signature | Injection site for custom `hp_cutoff()` |
-| 15 | `DcReject` | Derived (14 + 0x1E0) | Injection site for custom `dc_reject()` |
-| 16 | `DuplicateEmulateBitrateModified` | Derived (4 + 0x4EE6) | Parallel `imul` immediate → 512000 bps |
-| 17 | `EncoderConfigInit1` | Derived (9 + 0xA) | Config struct packed qword: 32000 → 512000 |
-| 18 | `EncoderConfigInit2` | Signature | Config struct packed qword: 32000 → 512000 |
-
-### Dependency Graph
-
-```
-EmulateStereoSuccess1 (sig)
- ├─→ EmulateStereoSuccess2     (+0x00C)
- ├─→ Emulate48Khz              (+0x168)
- ├─→ EmulateBitrateModified    (+0x45F)
- │    └─→ DuplicateEmulateBitrateModified  (+0x4EE6)
- └─→ HighPassFilter            (+0xC275)
-
-AudioEncoderOpusConfigSetChannels (sig)
- ├─→ EncoderConfigInit1        (+0x00A)
- └─→ AudioEncoderOpusConfigIsOk (+0x29C)
-
-SetsBitrateBitrateValue (sig)
- └─→ SetsBitrateBitwiseOr      (+0x008)
-
-HighpassCutoffFilter (sig)
- └─→ DcReject                  (+0x1E0)
-
-MonoDownmixer (sig)             [standalone]
-CreateAudioFrameStereo (sig)    [standalone]
-ThrowError (sig)                [standalone]
-DownmixFunc (sig)               [standalone]
-EncoderConfigInit2 (sig)        [standalone]
-```
-
-If `EmulateStereoSuccess1` fails, you lose 5 offsets. If `AudioEncoderOpusConfigSetChannels` fails, you lose 3. The other anchors are standalone or have only one dependent each.
+The finder discovers a fixed set of patch offsets: some are found directly by signatures (anchors), others are derived from anchors by adding deltas. The exact names, count, and derivation chain are defined in the script and may change with new Discord builds. Run the finder or inspect `discord_voice_node_offset_finder_v5.py` (e.g. `SIGNATURES`, `DERIVATIONS`, `EXPECTED_ORIGINALS`) for the current list. When an anchor fails, its dependents are skipped and reported in the console.
 
 ---
 
@@ -277,143 +227,7 @@ Target file offset = M + target_offset
 Config offset (RVA) = Target file offset + FILE_OFFSET_ADJUSTMENT (0xC00)
 ```
 
-A `target_offset` of 0 means the patch site is the first byte of the pattern itself. A value of 17 means the patch site is 17 bytes into the matched pattern. A value of -1 means the patch site is 1 byte before the pattern starts (used for `ThrowError` and `DownmixFunc` where the pattern matches the function body but the patch targets the byte before).
-
-### Signature Catalogue
-
-#### 1. EmulateStereoSuccess1
-
-```
-Pattern:  E8 ?? ?? ?? ?? BD ?? 00 00 00 80 BC 24 80 01 00 00 01
-Offset:   +6 (the ?? byte in BD ?? 00 00 00)
-Encodes:  call <rel32>; mov ebp, CHANNELS; cmp byte [rsp+0x180], 1
-```
-
-The `BD` is `mov ebp, imm32`. The second byte of that immediate is the channel count (`01` for mono). The pattern anchors on the distinctive `cmp byte [rsp+0x180], 1` which is a stack-frame-specific comparison unique to the stereo emulation function.
-
-This is the **most important anchor** — 5 other offsets derive from it.
-
-#### 2. AudioEncoderOpusConfigSetChannels
-
-```
-Pattern:  48 B9 14 00 00 00 80 BB 00 00 48 89 08 48 C7 40 08 ?? 00 00 00
-Offset:   +17 (the ?? byte)
-Encodes:  mov rcx, 0xBB80_0000_0014; mov [rax],rcx; mov qword [rax+8], CHANNELS
-```
-
-The magic constant `0xBB80_0000_0014` packs two Opus config fields: `48000` (0xBB80, sample rate) in the high dword and `20` (0x14, frame size in ms) in the low dword. This is globally unique in the binary.
-
-#### 3. MonoDownmixer
-
-```
-Pattern:  48 89 F9 E8 ?? ?? ?? ?? 84 C0 74 0D 83 BE ?? ?? 00 00 09 0F 8F
-Offset:   +8 (the 84 byte — start of test al,al)
-Encodes:  mov rcx,rdi; call <fn>; test al,al; jz +0xD; cmp [rsi+offs], 9; jg <rel32>
-```
-
-This pattern has **two matches** in the binary because the compiler emits similar code in two different functions. The `_mono_downmixer_disambiguator` callback (see below) selects the correct one.
-
-#### 4. SetsBitrateBitrateValue
-
-```
-Pattern:  89 F8 48 B9 ?? ?? ?? ?? 01 00 00 00 48 09 C1 48 89 4E 1C
-Offset:   +4 (start of the imm64)
-Encodes:  mov eax,edi; mov rcx, <bitrate_imm64>; or rcx,rax; mov [rsi+0x1C], rcx
-```
-
-The `48 09 C1` (`or rcx, rax`) and `48 89 4E 1C` (`mov [rsi+0x1C], rcx`) form a unique two-instruction suffix. The patcher overwrites both the immediate value and NOPs out the `or` to store a clean 512000 value.
-
-#### 5. ThrowError
-
-```
-Pattern:  56 56 57 53 48 81 EC C8 00 00 00 0F 29 B4 24 B0 00 00 00 4C 89 CE 4C 89 C7 89 D3
-Offset:   -1 (one byte before pattern = the push r14 that precedes push rsi)
-Encodes:  push r14; push rsi; push rdi; push rbx; sub rsp,0xC8; movaps [rsp+0xB0],xmm6; ...
-```
-
-The combination of `sub rsp, 0xC8` + SSE save to `[rsp+0xB0]` + the three `mov` register saves is unique. The `41` byte before the pattern is the REX prefix of `push r14` — the patcher replaces it with `C3` (ret) to disable the entire function.
-
-#### 6. DownmixFunc
-
-```
-Pattern:  57 41 56 41 55 41 54 56 57 55 53 48 83 EC 10 48 89 0C 24 45 85 C0
-Offset:   -1 (push r15 before the matched push r14)
-Encodes:  push r15; push r14; push r13; push r12; push rsi; push rdi; push rbp; push rbx; sub rsp,0x10; ...
-```
-
-Eight callee-saved register pushes followed by `sub rsp,0x10` and `mov [rsp],rcx; test r8d,r8d` — this specific sequence of 8 pushes is unique in the binary. Note: this function has **zero direct `CALL` references** — it's invoked via function pointer / vtable, which is why we can't find callers via simple xref scanning.
-
-#### 7. CreateAudioFrameStereo
-
-```
-Pattern:  B8 80 BB 00 00 BD 00 7D 00 00 0F 43 E8
-Offset:   +31 (second cmovae, 31 bytes past the pattern start)
-Encodes:  mov eax, 48000; mov ebp, 32000; cmovae ebp, eax; ... [31 bytes later] ... cmovae r13, rax
-```
-
-The magic pair `48000` (0xBB80) and `32000` (0x7D00) as adjacent `mov` immediates is globally unique. The target is a second `cmovae` 31 bytes later that conditionally selects a buffer size — the patcher forces it unconditional.
-
-#### 8. HighpassCutoffFilter
-
-```
-Pattern:  56 48 83 EC 30 44 0F 29 44 24 20 0F 29 7C 24 10 0F 29 34 24
-Offset:   +0 (pattern start = function entry)
-Encodes:  push rsi; sub rsp,0x30; movaps [rsp+0x20],xmm8; movaps [rsp+0x10],xmm7; movaps [rsp],xmm6
-```
-
-Three SSE register saves to specific stack slots after `sub rsp,0x30`. This is unique because the exact combination of `xmm8`/`xmm7`/`xmm6` saves to these offsets only appears in the high-pass cutoff filter function.
-
-#### 9. EncoderConfigInit2
-
-```
-Pattern:  48 B9 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 48 10 66 C7 40 18 00 00 C6 40 1A 00
-Offset:   +6 (byte 6 of the 8-byte immediate in mov rcx)
-Encodes:  mov rcx, <packed_qword>; mov [rax+0x10], rcx; mov word [rax+0x18], 0; mov byte [rax+0x1a], 0
-```
-
-The post-`mov` instruction sequence (`mov [rax+0x10]`, `mov word [rax+0x18], 0`, `mov byte [rax+0x1a], 0`) is a config struct initializer pattern unique to the second Opus encoder constructor. The target is bytes 6-9 of the immediate (the high dword of the packed qword), which encodes the default bitrate.
-
-### Disambiguators
-
-#### `_mono_downmixer_disambiguator`
-
-**Problem:** The MonoDownmixer pattern matches twice — once in the actual audio frame processing function and once in a different function with similar control flow.
-
-**Solution:** After the `jg` (0F 8F) branch in the pattern, the real downmixer loads channel flags via `movzx r??d, byte [rsp+??]` (encoded as `44 0F B6`). The false positive uses `test [reg+offset]` instead.
-
-```python
-def _mono_downmixer_disambiguator(data, match_offset):
-    jg_pos = match_offset + 19         # 0F 8F is at pattern byte 19
-    after_jg = data[jg_pos+6 : jg_pos+18]  # skip the 6-byte jg instruction
-    return b'\x44\x0f\xb6' in after_jg     # REX.R movzx present?
-```
-
----
-
-## Derivation Reference
-
-All relative deltas in one table:
-
-| Derived Offset | Anchor | Delta | Hex | Rationale |
-|----------------|--------|-------|-----|-----------|
-| `EmulateStereoSuccess2` | `EmulateStereoSuccess1` | +12 | +0xC | Next conditional branch in same basic block |
-| `Emulate48Khz` | `EmulateStereoSuccess1` | +360 | +0x168 | Sample rate `cmovb` in same function |
-| `EmulateBitrateModified` | `EmulateStereoSuccess1` | +1119 | +0x45F | Bitrate `imul` in same function |
-| `HighPassFilter` | `EmulateStereoSuccess1` | +49781 | +0xC275 | HP filter call in same compilation unit |
-| `SetsBitrateBitwiseOr` | `SetsBitrateBitrateValue` | +8 | +0x8 | `or` instruction immediately after `mov rcx, imm64` |
-| `AudioEncoderOpusConfigIsOk` | `AudioEncoderOpusConfigSetChannels` | +668 | +0x29C | Validation function in same translation unit |
-| `EncoderConfigInit1` | `AudioEncoderOpusConfigSetChannels` | +10 | +0xA | Same constructor, 10 bytes after channels byte |
-| `DcReject` | `HighpassCutoffFilter` | +480 | +0x1E0 | Next function in .text section (adjacent) |
-| `DuplicateEmulateBitrateModified` | `EmulateBitrateModified` | +20198 | +0x4EE6 | Parallel template instantiation in same TU |
-
-**Stability basis:** These deltas survive recompilation because:
-
-- Same basic block (ES2 from ES1): Instruction sequence is deterministic
-- Same function (48Khz, Bitrate from ES1): No code between them that varies in size
-- Same compilation unit (HighPassFilter from ES1, ConfigIsOk from Channels): Linker preserves intra-TU ordering
-- Adjacent functions (DcReject from HPC): Linker preserves function order within a section
-
-The deltas were verified identical between the December 2025 (build 9219) and February 2026 (Feb 9) builds.
+A `target_offset` of 0 means the patch site is the first byte of the pattern itself. Positive values mean the patch site is that many bytes into the matched pattern; negative values mean the patch site is before the pattern start (e.g. for entry-point patches where the pattern matches the function body but the patch targets the prologue byte).
 
 ---
 
@@ -545,7 +359,7 @@ On non-Windows platforms, auto-detection is not supported — pass the path expl
 | `1` | Partial success — enough for basic patching | 15-17/18 |
 | `2` | Insufficient — too many missing for safe patching | < 15/18 |
 
-The thresholds are intentionally conservative. 15/18 means the three v5.0 offsets (`DuplicateEmulateBitrateModified`, `EncoderConfigInit1`, `EncoderConfigInit2`) might be missing — the patcher can still function at reduced effectiveness (bitrate defaults may leak through on some code paths).
+The thresholds are intentionally conservative. Partial success allows the patcher to still function at reduced effectiveness when a few offsets are missing (e.g. some bitrate defaults may leak through on certain code paths). See the script for the exact counts and thresholds.
 
 ---
 
@@ -603,8 +417,7 @@ In `format_powershell_config`, add the name to `ordered_names` in the desired po
 ### Step 5: Update counts
 
 - Docstring: update offset/signature/derived counts
-- Exit code thresholds: update `18` to `19`, partial threshold if needed
-- README (this file): add to the offset table and dependency graph
+- Exit code thresholds: update total offset count and partial threshold if needed
 
 ---
 
@@ -642,4 +455,4 @@ When Discord ships a new `discord_voice.node`:
 
 - **No ASLR handling.** The tool works with file offsets / RVAs, not runtime virtual addresses. The patcher handles ASLR via `GetModuleHandle` at runtime.
 
-- **Disambiguator fragility.** The MonoDownmixer disambiguator relies on a specific instruction (`44 0F B6`, REX.R movzx) appearing within 12 bytes of the branch. If the compiler restructures that code, the disambiguator might fail even though the signature matches. In that case, a new disambiguator or a more specific signature pattern would be needed.
+- **Disambiguator fragility.** Some signatures use disambiguator callbacks to choose among multiple pattern matches. Those callbacks rely on nearby instruction patterns; if the compiler restructures the code, a disambiguator can fail even when the signature still matches. Updating the disambiguator or tightening the signature in the script fixes it.
