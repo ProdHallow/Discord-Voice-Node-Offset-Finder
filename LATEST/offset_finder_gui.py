@@ -16,12 +16,11 @@ from datetime import datetime
 from pathlib import Path
 import importlib.util
 import io
-import contextlib
 
 VERSION = "1.0.0"
 SCRIPT_DIR = Path(__file__).parent
+TARGET_BITRATE_KBPS = 384
 
-# --- Theme Colors (matching Stereo Installer) ---------------------------------
 BG           = "#1e1e1e"
 BG_LIGHT     = "#2d2d2d"
 BG_INPUT     = "#1a1a1a"
@@ -52,7 +51,6 @@ class OffsetFinderGUI:
         self.root.minsize(620, 580)
         self.root.geometry("660x700")
 
-        # Try to set icon (optional)
         try:
             self.root.iconbitmap(default="")
         except Exception:
@@ -63,14 +61,13 @@ class OffsetFinderGUI:
         self.file_path = tk.StringVar()
         self.os_var = tk.StringVar(value="Auto-Detect")
         self.status_var = tk.StringVar(value="Ready")
-        self.last_output = ""  # plain-text copy of last run output for saving
+        self.last_output = ""
+        self.last_windows_block = ""
 
         self._build_ui()
         self._load_finder()
 
-    # --- UI Construction -----------------------------------------------------
     def _build_ui(self):
-        # Title area
         title_frame = tk.Frame(self.root, bg=BG)
         title_frame.pack(fill="x", padx=16, pady=(14, 0))
 
@@ -81,14 +78,12 @@ class OffsetFinderGUI:
         tk.Label(title_frame, text=f"v{VERSION}",
                  font=("Segoe UI", 8), bg=BG, fg=FG_DIM).pack()
 
-        # --- Binary Selection Group ---
         sel_frame = tk.LabelFrame(self.root, text=" Binary Selection ",
                                   font=("Segoe UI", 9, "bold"),
                                   bg=BG_LIGHT, fg=FG, bd=1, relief="groove",
                                   highlightbackground=BORDER, highlightthickness=1)
         sel_frame.pack(fill="x", padx=16, pady=(12, 0), ipady=4)
 
-        # OS row
         os_row = tk.Frame(sel_frame, bg=BG_LIGHT)
         os_row.pack(fill="x", padx=10, pady=(8, 4))
         tk.Label(os_row, text="Target OS:", font=("Segoe UI", 9),
@@ -102,7 +97,6 @@ class OffsetFinderGUI:
                            font=("Segoe UI", 8), bg=BG_LIGHT, fg=FG_DIM)
         os_hint.pack(side="left", padx=(8, 0))
 
-        # File row
         file_row = tk.Frame(sel_frame, bg=BG_LIGHT)
         file_row.pack(fill="x", padx=10, pady=(4, 8))
         tk.Label(file_row, text="Node File:", font=("Segoe UI", 9),
@@ -121,7 +115,6 @@ class OffsetFinderGUI:
                                     cursor="hand2", command=self._browse_file)
         self.browse_btn.pack(side="right")
 
-        # --- Options Group ---
         opt_frame = tk.LabelFrame(self.root, text=" Options ",
                                   font=("Segoe UI", 9, "bold"),
                                   bg=BG_LIGHT, fg=FG, bd=1, relief="groove",
@@ -154,7 +147,6 @@ class OffsetFinderGUI:
                                 bd=0, anchor="w")
             cb.pack(anchor="w", pady=1)
 
-        # --- Output Area ---
         output_frame = tk.Frame(self.root, bg=BG)
         output_frame.pack(fill="both", expand=True, padx=16, pady=(10, 0))
 
@@ -164,7 +156,6 @@ class OffsetFinderGUI:
             highlightbackground=BORDER, highlightthickness=1, state="disabled")
         self.output.pack(fill="both", expand=True)
 
-        # Configure output text tags for colored output
         self.output.tag_config("pass", foreground=GREEN)
         self.output.tag_config("fail", foreground=RED)
         self.output.tag_config("warn", foreground=YELLOW)
@@ -172,7 +163,6 @@ class OffsetFinderGUI:
         self.output.tag_config("header", foreground=ORANGE, font=("Consolas", 9, "bold"))
         self.output.tag_config("success", foreground=GREEN, font=("Consolas", 10, "bold"))
 
-        # --- Status Bar ---
         status_frame = tk.Frame(self.root, bg=BG_LIGHT, height=24)
         status_frame.pack(fill="x", padx=16, pady=(6, 0))
         self.status_label = tk.Label(status_frame, textvariable=self.status_var,
@@ -180,7 +170,6 @@ class OffsetFinderGUI:
                                      anchor="w")
         self.status_label.pack(fill="x", padx=6, pady=2)
 
-        # --- Button Bar ---
         btn_frame = tk.Frame(self.root, bg=BG)
         btn_frame.pack(fill="x", padx=16, pady=(8, 14))
 
@@ -192,6 +181,10 @@ class OffsetFinderGUI:
                                           self._copy_output)
         self.copy_btn.pack(side="left", padx=(0, 6))
 
+        self.copy_block_btn = self._make_button(btn_frame, "Copy Block", BLUE, BLUE_HOVER,
+                                                self._copy_block)
+        self.copy_block_btn.pack(side="left", padx=(0, 6))
+
         self.save_btn = self._make_button(btn_frame, "Save Results", GRAY_BTN, GRAY_HOVER,
                                           self._save_results)
         self.save_btn.pack(side="left", padx=(0, 6))
@@ -200,10 +193,8 @@ class OffsetFinderGUI:
                                            self._clear_output)
         self.clear_btn.pack(side="left")
 
-        # Drag and drop hint
         self._append_output("  Drop a discord_voice.node file or click Browse to begin.\n", "info")
 
-        # Bind drag-and-drop if available (tkinterdnd2)
         try:
             self.root.drop_target_register('DND_Files')
             self.root.dnd_bind('<<Drop>>', self._on_drop)
@@ -220,7 +211,6 @@ class OffsetFinderGUI:
         btn.bind("<Leave>", lambda e, b=btn, c=bg_color: b.configure(bg=c))
         return btn
 
-    # --- Actions -------------------------------------------------------------
     def _browse_file(self):
         path = filedialog.askopenfilename(
             title="Select discord_voice.node",
@@ -230,11 +220,9 @@ class OffsetFinderGUI:
             ])
         if path:
             self.file_path.set(path)
-            # Auto-detect OS from file
             self._auto_detect_os(path)
 
     def _auto_detect_os(self, path):
-        """Read first 4 bytes to auto-detect binary format."""
         try:
             with open(path, "rb") as f:
                 magic = f.read(4)
@@ -261,6 +249,7 @@ class OffsetFinderGUI:
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
         self.last_output = ""
+        self.last_windows_block = ""
 
     def _copy_output(self):
         text = self.last_output.strip()
@@ -268,13 +257,21 @@ class OffsetFinderGUI:
             text = self.output.get("1.0", "end").strip()
         if text:
             self.root.clipboard_clear()
-            self.root.clipboard_append(text)
+            self.root.clipboard_append(text.encode("ascii", "replace").decode("ascii"))
             self.status_var.set("Output copied to clipboard")
+
+    def _copy_block(self):
+        block = self.last_windows_block.strip()
+        if not block:
+            self.status_var.set("No Windows block to copy (run Find Offsets first)")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(block.encode("ascii", "replace").decode("ascii"))
+        self.status_var.set("Block copied (paste into patcher)")
 
     def _save_results(self):
         text = self.last_output.strip()
         if not text:
-            # Fallback: try reading widget directly
             text = self.output.get("1.0", "end").strip()
         if not text:
             self.status_var.set("Nothing to save")
@@ -288,18 +285,13 @@ class OffsetFinderGUI:
                 f.write(text)
             self.status_var.set(f"Saved to {path}")
 
-    # --- Finder Integration --------------------------------------------------
     def _load_finder(self):
-        """Dynamically import the offset finder script from same directory."""
         finder_path = None
-
-        # Find any offset finder script in the same folder - don't care about name
         for f in sorted(SCRIPT_DIR.glob("*.py"), reverse=True):
             if f.name == Path(__file__).name:
-                continue  # skip ourselves
+                continue
             try:
                 text = f.read_text(encoding="utf-8", errors="ignore")[:4000]
-                # Look for identifiers that appear early in the offset finder script
                 if "Discord Voice Node Offset Finder" in text or \
                    ("SIGNATURES" in text and "VERSION" in text):
                     finder_path = f
@@ -340,27 +332,21 @@ class OffsetFinderGUI:
         self.run_btn.configure(state="disabled", bg=GRAY_BTN)
         self._clear_output()
 
-        # Get file info
         fsize = os.path.getsize(path)
         fname = os.path.basename(path)
         self._append_output(f"  File: {fname}\n", "header")
         self._append_output(f"  Size: {fsize:,} bytes | OS: {self.os_var.get()}\n", "info")
         self._append_output(f"  {'-' * 55}\n\n", "info")
 
-        # Run in background thread
         thread = threading.Thread(target=self._run_finder_thread, args=(path,), daemon=True)
         thread.start()
 
     def _run_finder_thread(self, path):
-        """Execute the offset finder and capture output."""
         try:
             mod = self.finder_module
-
-            # Read binary
             with open(path, "rb") as f:
                 data = f.read()
 
-            # Detect format
             bin_info = mod.detect_binary_format(data)
             fmt = bin_info.get("format", "unknown")
             arch = bin_info.get("arch", "unknown")
@@ -380,7 +366,6 @@ class OffsetFinderGUI:
 
             self._append_output_safe(f"\n  Scanning for offsets...\n\n", "header")
 
-            # Capture stdout from discover_offsets
             old_stdout = sys.stdout
             capture = io.StringIO()
             sys.stdout = capture
@@ -390,7 +375,6 @@ class OffsetFinderGUI:
             finally:
                 sys.stdout = old_stdout
 
-            # Parse and colorize captured output
             captured = capture.getvalue()
             for line in captured.splitlines():
                 tag = None
@@ -406,21 +390,41 @@ class OffsetFinderGUI:
                     tag = "header"
                 self._append_output_safe(line + "\n", tag)
 
-            # Summary
             total = 18
             found = len(results)
+            patcher_names = getattr(mod, "PATCHER_OFFSET_NAMES", None)
+            is_pe = fmt == "pe"
+            patcher_count = sum(1 for k in patcher_names if k in results) if (is_pe and patcher_names) else found
+            n_patcher = len(patcher_names) if patcher_names else 17
+
             self._append_output_safe(f"\n  {'=' * 55}\n", "header")
-            if found == total:
+            self._append_output_safe(f"  RESULTS SUMMARY\n", "header")
+            self._append_output_safe(f"  {'=' * 55}\n", "header")
+            if is_pe and patcher_names:
                 self._append_output_safe(
-                    f"  [OK] ALL {found} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
+                    f"  Windows patcher:   {patcher_count} / {n_patcher}  (required for Discord_voice_node_patcher.ps1)\n", "info")
+                self._append_output_safe(
+                    f"  x86_64 discovered: {found} offsets\n", "info")
+                if patcher_count == n_patcher:
+                    self._append_output_safe(
+                        f"  [OK] ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND\n", "success")
+                else:
+                    self._append_output_safe(
+                        f"  Windows patcher: {patcher_count}/{n_patcher} ({n_patcher - patcher_count} missing)\n", "warn")
             else:
-                self._append_output_safe(
-                    f"  x86_64: Found {found}/{total} offsets ({total - found} missing)\n", "warn")
-                if errors:
-                    for e in errors:
+                if found == total:
+                    self._append_output_safe(
+                        f"  [OK] ALL {found} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
+                else:
+                    self._append_output_safe(
+                        f"  x86_64: Found {found}/{total} offsets ({total - found} missing)\n", "warn")
+            if errors:
+                for e in errors:
+                    if isinstance(e, (list, tuple)) and len(e) >= 2:
+                        self._append_output_safe(f"  Missing: {e[0]}: {e[1]}\n", "fail")
+                    else:
                         self._append_output_safe(f"  Missing: {e}\n", "fail")
 
-            # Cross-validation
             try:
                 xval = mod._cross_validate(results, adj, data, tiers_used=tiers_used)
                 if xval:
@@ -431,7 +435,6 @@ class OffsetFinderGUI:
             except Exception:
                 pass
 
-            # ARM64 discovery (fat Mach-O with arm64 slice)
             arm64_found = 0
             arm64_info = bin_info.get("arm64_info")
             if arm64_info and hasattr(mod, "discover_offsets_arm64"):
@@ -463,34 +466,62 @@ class OffsetFinderGUI:
                 self._append_output_safe(f"\n  arm64: {arm64_found}/{total} offsets found\n",
                                          "success" if arm64_found == total else "warn")
 
-            # Generate PowerShell config
-            self._append_output_safe(f"\n", None)
-            try:
-                old_stdout = sys.stdout
-                ps_capture = io.StringIO()
-                sys.stdout = ps_capture
-                ps_text = mod.format_powershell_config(
-                    results, bin_info=bin_info, file_path=path,
-                    file_size=len(data))
-                sys.stdout = old_stdout
-                if ps_text:
-                    self._append_output_safe(ps_text + "\n", None)
-            except Exception:
-                sys.stdout = old_stdout
-
-            # Platform-specific copy-paste block for the matching patcher
             file_size = len(data)
+
+            encoder_config_init3_rva = None
+            if fmt == "pe" and hasattr(mod, "run_bitrate_audit_pe"):
+                ts = bin_info.get("text_section")
+                t_start = ts["raw_offset"] if ts else 0
+                t_end = (ts["raw_offset"] + ts["raw_size"]) if ts else len(data)
+                old_stdout = sys.stdout
+                audit_out = io.StringIO()
+                sys.stdout = audit_out
+                try:
+                    encoder_config_init3_rva = mod.run_bitrate_audit_pe(data, results, adj, t_start, t_end)
+                finally:
+                    sys.stdout = old_stdout
+                for line in audit_out.getvalue().splitlines():
+                    tag = "header" if "====" in line or "BITRATE" in line else ("warn" if "uncovered" in line else None)
+                    self._append_output_safe(line + "\n", tag)
+
             if fmt == "pe" and hasattr(mod, "format_windows_patcher_block"):
-                block = mod.format_windows_patcher_block(results, bin_info, path, file_size)
+                block = mod.format_windows_patcher_block(results, bin_info, path, file_size, optional_encoder_config_init3=encoder_config_init3_rva)
                 if block:
-                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                    self.last_windows_block = block.encode("ascii", "replace").decode("ascii")
+                else:
+                    self.last_windows_block = ""
+                if block:
+                    self._append_output_safe("\n", None)
+                    self._append_output_safe("  " + "=" * 55 + "\n", "header")
                     self._append_output_safe("  COPY BELOW -> Discord_voice_node_patcher.ps1\n", "header")
-                    self._append_output_safe("  Replace the entire # region Offsets ... # endregion section\n", "info")
                     self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
                     self._append_output_safe("--- BEGIN COPY (Windows) ---\n", None)
-                    self._append_output_safe(block + "\n", None)
+                    self._append_output_safe(block if block.endswith("\n") else block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
-            elif fmt == "elf" and hasattr(mod, "format_linux_patcher_block"):
+                    if hasattr(mod, "format_windows_debug_mode"):
+                        self._append_output_safe("  DEBUG MODE (patch names)\n", "header")
+                        self._append_output_safe("  " + "-" * 55 + "\n", "header")
+                        self._append_output_safe(mod.format_windows_debug_mode(results) + "\n\n", None)
+
+            if fmt != "pe":
+                self._append_output_safe(f"\n", None)
+                try:
+                    old_stdout = sys.stdout
+                    ps_capture = io.StringIO()
+                    sys.stdout = ps_capture
+                    ps_text = mod.format_powershell_config(
+                        results, bin_info=bin_info, file_path=path,
+                        file_size=len(data))
+                    sys.stdout = old_stdout
+                    if ps_text:
+                        self._append_output_safe("  " + "=" * 55 + "\n", "header")
+                        self._append_output_safe("  PATCHER OFFSET TABLE\n", "header")
+                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                        self._append_output_safe(ps_text + "\n", None)
+                except Exception:
+                    sys.stdout = old_stdout
+
+            if fmt == "elf" and hasattr(mod, "format_linux_patcher_block"):
                 block = mod.format_linux_patcher_block(results, bin_info, path, file_size)
                 if block:
                     self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
@@ -511,17 +542,19 @@ class OffsetFinderGUI:
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
 
-            # Save JSON if requested
             if self.save_json.get():
                 try:
                     json_path = Path(path).with_suffix(".offsets.json")
                     json_text = mod.format_json(results, bin_info, path, len(data), adj, tiers_used)
-                    json_path.write_text(json_text, encoding="utf-8")
+                    json_path.write_text(json_text, encoding="ascii")
                     self._append_output_safe(f"\n  JSON saved: {json_path}\n", "info")
                 except Exception as e:
                     self._append_output_safe(f"\n  JSON save error: {e}\n", "warn")
 
-            status_msg = f"Done - x86_64: {found}/{total}"
+            if is_pe and patcher_names:
+                status_msg = f"Done - Windows patcher: {patcher_count}/{n_patcher} | x86_64: {found}/18"
+            else:
+                status_msg = f"Done - x86_64: {found}/{total}"
             if arm64_found > 0:
                 status_msg += f" | arm64: {arm64_found}/{total}"
             status_msg += f" | {datetime.now().strftime('%H:%M:%S')}"
@@ -540,7 +573,6 @@ class OffsetFinderGUI:
         self.running = False
         self.run_btn.configure(state="normal", bg=GREEN)
 
-    # --- Thread-safe output helpers ------------------------------------------
     def _append_output(self, text, tag=None):
         self.output.configure(state="normal")
         if tag:
@@ -560,8 +592,6 @@ class OffsetFinderGUI:
 
 def main():
     root = tk.Tk()
-
-    # Dark title bar on Windows 10/11
     try:
         from ctypes import windll, c_int, byref
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -572,8 +602,6 @@ def main():
             byref(c_int(1)), 4)
     except Exception:
         pass
-
-    # Style the combobox dropdown
     style = ttk.Style()
     style.theme_use("clam")
     style.configure("TCombobox",

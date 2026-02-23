@@ -1,50 +1,9 @@
 #!/usr/bin/env python3
 """
 Discord Voice Node Offset Finder v5.0
-=======================================
-Cross-platform offset discovery for discord_voice.node (PE/Mach-O/ELF).
-Automatically discovers all 18 patch offsets using tiered signature scanning,
-chained derivation, sliding-window recovery, and structural heuristics.
-
-Platform support:
-  Windows (PE64)  - full signature scanning + derivation
-  Linux   (ELF)   - symbol table + targeted instruction scanning + Clang patterns
-  macOS   (Mach-O) - symbol table + Clang alternates + stereo mic patch finder (x86_64+arm64)
-
-Resolution pipeline (each tier is attempted only if the previous one failed):
-  Tier 0 - ELF/Mach-O symbol table lookup (debug symbols present on Linux; partial on macOS)
-  Tier 0b - Targeted instruction scanning within symbol-bounded functions (Linux/macOS)
-  Tier 1 - Primary byte-pattern signatures (9 anchors)
-  Tier 2 - Relaxed alternate signatures (broader wildcards)
-  Tier 2c - Clang/platform-specific alternate patterns (macOS/Linux)
-  Tier 3 - Patched-binary fallback patterns
-  Tier 4 - Topologically-sorted relative derivation (9 chained offsets)
-  Tier 5 - Sliding-window derivation recovery (+/-128 bytes around expected)
-  Tier 6 - Structural heuristic scanning (Opus constants, imul patterns)
-
-macOS stereo mic patch finder: scans fat/universal Mach-O for 19 stereo patches
-  across both x86_64 and arm64 slices using dedicated signature sets.
-
-Cross-validation verifies consistency between independently-found offsets.
-
-Expected byte verification uses three-layer overrides:
-  - Base:       EXPECTED_ORIGINALS (Windows/MSVC defaults)
-  - Clang:      EXPECTED_ORIGINALS_CLANG (universal Clang differences, macOS+Linux)
-  - Linux-only: EXPECTED_ORIGINALS_LINUX_ONLY (logic inversions specific to Linux)
-  - macOS-only: EXPECTED_ORIGINALS_MACHO_ONLY (prologue differences specific to macOS)
-
-Signature stability verified across:
-  - December 2025 build (9219)
-  - February 2026 build (Feb 9, 2026)
-  - Linux ELF binary (Aug 2025, Clang)
-  - macOS fat binary (Feb 2026, x86_64+arm64)
-
-Usage:
-  python discord_voice_node_offset_finder.py <path_to_discord_voice.node>
-  python discord_voice_node_offset_finder.py  (auto-detects Discord install)
-
-Requirements: Python 3.6+ (stdlib only)
-Optional:     networkx + matplotlib (for dependency graph PNG)
+Cross-platform offset discovery for discord_voice.node (PE/ELF/Mach-O).
+Windows: 19 offsets for Discord_voice_node_patcher.ps1. Linux/macOS: 18.
+Usage: python discord_voice_node_offset_finder_v5.py [path_to_discord_voice.node]
 """
 
 import sys
@@ -68,66 +27,54 @@ except ImportError:
 
 VERSION = "5.0"
 
+TARGET_BITRATE_BPS = 384000
+_BITRATE_LE = TARGET_BITRATE_BPS.to_bytes(4, "little")
+BITRATE_PATCH_3 = " ".join(f"{b:02X}" for b in _BITRATE_LE[:3])
+BITRATE_PATCH_4 = " ".join(f"{b:02X}" for b in _BITRATE_LE)
+BITRATE_PATCH_5 = BITRATE_PATCH_4 + " 00"
 
-# region Configuration
-
-# Relative offset derivation map.
-# Format: derived_name -> [(anchor_name, delta), ...] (tried in order)
-# Multiple paths provide chained fallback: if the first anchor isn't found,
-# the next path is attempted.  This is critical for DuplicateEmulateBitrateModified
-# which chains through EmulateBitrateModified (itself derived).
 DERIVATIONS = {
     "EmulateStereoSuccess2": [
-        ("EmulateStereoSuccess1", 0xC),     # Windows delta
-        ("EmulateStereoSuccess1", 0x1),     # Linux delta (je immediately after cmp byte)
+        ("EmulateStereoSuccess1", 0xC),
+        ("EmulateStereoSuccess1", 0x1),
     ],
     "Emulate48Khz": [
-        ("EmulateStereoSuccess1", 0x168),   # Windows delta
+        ("EmulateStereoSuccess1", 0x168),
     ],
     "EmulateBitrateModified": [
-        ("EmulateStereoSuccess1", 0x45F),   # Windows delta
+        ("EmulateStereoSuccess1", 0x45F),
     ],
     "HighPassFilter": [
-        ("EmulateStereoSuccess1", 0xC275),  # Windows delta
+        ("EmulateStereoSuccess1", 0xC275),
     ],
     "SetsBitrateBitwiseOr": [
-        ("SetsBitrateBitrateValue", 0x8),   # Same on both platforms
+        ("SetsBitrateBitrateValue", 0x8),
     ],
     "AudioEncoderOpusConfigIsOk": [
-        ("AudioEncoderOpusConfigSetChannels", 0x29C),  # Windows delta
-        ("AudioEncoderOpusConfigSetChannels", 0x19B),  # Linux delta
-        ("AudioEncoderOpusConfigSetChannels", 0x30B),  # macOS delta
+        ("AudioEncoderOpusConfigSetChannels", 0x29C),
+        ("AudioEncoderOpusConfigSetChannels", 0x19B),
+        ("AudioEncoderOpusConfigSetChannels", 0x30B),
     ],
     "DcReject": [
-        ("HighpassCutoffFilter", 0x1E0),    # Windows delta
-        ("HighpassCutoffFilter", 0x1B0),    # Linux delta
+        ("HighpassCutoffFilter", 0x1E0),
+        ("HighpassCutoffFilter", 0x1B0),
     ],
     "EncoderConfigInit1": [
-        ("AudioEncoderOpusConfigSetChannels", 0xA),  # Same on both platforms
+        ("AudioEncoderOpusConfigSetChannels", 0xA),
     ],
     "DuplicateEmulateBitrateModified": [
-        ("EmulateBitrateModified", 0x4EE6),           # primary: chained via derived anchor
-        ("EmulateStereoSuccess1", 0x45F + 0x4EE6),    # fallback: direct from root anchor
+        ("EmulateBitrateModified", 0x4EE6),
+        ("EmulateStereoSuccess1", 0x45F + 0x4EE6),
     ],
 }
 
-# Sliding window parameters for derivation recovery.
-# When exact delta fails byte verification, scan this many bytes in each
-# direction for the expected original bytes.
 SLIDING_WINDOW_DEFAULT = 128
 SLIDING_WINDOW_OVERRIDES = {
-    # Single-byte expected values get a tighter window to reduce false positives
-    "EmulateStereoSuccess2": 48,     # expected: 0x75 (jne)
-    "EncoderConfigInit1": 48,        # expected: 00 7D 00 00 (distinctive 4-byte)
+    "EmulateStereoSuccess2": 48,
+    "EncoderConfigInit1": 48,
 }
 
-# endregion Configuration
-
-
-# region Signature Definitions
-
 class Signature:
-    """Defines a byte pattern signature with optional relaxed alternates."""
 
     def __init__(self, name, pattern_hex, target_offset, description,
                  expected_original=None, patch_bytes=None, patch_len=None,
@@ -155,23 +102,16 @@ class Signature:
 
 
 def _mono_downmixer_disambiguator(data, match_offset):
-    """Select the correct MonoDownmixer by checking for REX.R movzx (44 0F B6)
-    after the jg branch.  Uses a broad 70-byte window so the match survives
-    if the compiler inserts extra instructions between the jg and the movzx."""
     jg_pos = match_offset + 19
     if jg_pos + 6 > len(data):
         return False
-    # Tight window first (high confidence, fast)
     if b'\x44\x0f\xb6' in data[jg_pos + 6 : jg_pos + 18]:
         return True
-    # Broad window (survives extra compiler-inserted instructions)
     if b'\x44\x0f\xb6' in data[jg_pos + 6 : jg_pos + 70]:
         return True
     return False
 
 
-# 9 independent anchor signatures with relaxed alternates.
-# Primary patterns are exact; alt_patterns wildcard bytes the compiler may vary.
 SIGNATURES = [
     Signature(
         name="EmulateStereoSuccess1",
@@ -181,9 +121,7 @@ SIGNATURES = [
         expected_original="01",
         patch_bytes="02",
         alt_patterns=[
-            # Stack offset 0x180 might change with MSVC version bump
             ("E8 ?? ?? ?? ?? BD ?? 00 00 00 80 BC 24 ?? ?? 00 00 01", 6),
-            # Even broader: just the mov ebp + cmp structure
             ("BD ?? 00 00 00 80 BC 24 ?? ?? 00 00 01", 1),
         ],
     ),
@@ -196,9 +134,7 @@ SIGNATURES = [
         expected_original="01",
         patch_bytes="02",
         alt_patterns=[
-            # Wildcard the [rax+8] offset in case struct layout shifts
             ("48 B9 14 00 00 00 80 BB 00 00 48 89 08 48 C7 40 ?? ?? 00 00 00", 17),
-            # Wildcard the store register too
             ("48 B9 14 00 00 00 80 BB 00 00 48 89 ?? 48 C7 ?? ?? ?? 00 00 00", 17),
         ],
     ),
@@ -213,7 +149,6 @@ SIGNATURES = [
         patch_len=13,
         disambiguator=_mono_downmixer_disambiguator,
         alt_patterns=[
-            # Compiler might use different register for mov rcx,rdi
             ("48 89 ?? E8 ?? ?? ?? ?? 84 C0 ?? ?? 83 ?? ?? ?? 00 00 09 0F 8F", 8),
         ],
     ),
@@ -225,9 +160,7 @@ SIGNATURES = [
         description="Bitrate setter: mov eax,edi; mov rcx,imm64; or rcx,rax; mov [rsi+0x1C],rcx",
         expected_original=None,
         alt_patterns=[
-            # Struct offset 0x1C might change
             ("89 F8 48 B9 ?? ?? ?? ?? 01 00 00 00 48 09 C1 48 89 ?? ??", 4),
-            # Source register might change
             ("89 ?? 48 B9 ?? ?? ?? ?? 01 00 00 00 48 09 C1 48 89 ?? ??", 4),
         ],
     ),
@@ -240,7 +173,6 @@ SIGNATURES = [
         expected_original="41",
         patch_bytes="C3",
         alt_patterns=[
-            # Stack frame size and SSE save offset might change together
             ("56 56 57 53 48 81 EC ?? ?? 00 00 0F 29 B4 24 ?? ?? 00 00 4C 89 CE 4C 89 C7 89 D3", -1),
         ],
     ),
@@ -253,9 +185,7 @@ SIGNATURES = [
         expected_original="41",
         patch_bytes="C3",
         alt_patterns=[
-            # Sub rsp size might change
             ("57 41 56 41 55 41 54 56 57 55 53 48 83 EC ?? 48 89 0C 24 45 85 C0", -1),
-            # Even more relaxed: just the 8 push sequence
             ("57 41 56 41 55 41 54 56 57 55 53 48 83 EC ?? 48 89 0C 24", -1),
         ],
     ),
@@ -268,7 +198,6 @@ SIGNATURES = [
         expected_original="4C 0F 43 E8",
         patch_bytes="49 89 C5 90",
         alt_patterns=[
-            # cmov encoding might vary (0F 43 is cmovae, could be 0F 42 cmovb)
             ("B8 80 BB 00 00 BD 00 7D 00 00 0F ?? E8", 31),
         ],
     ),
@@ -282,121 +211,65 @@ SIGNATURES = [
         patch_bytes=None,
         patch_len=0x100,
         alt_patterns=[
-            # Sub rsp size and SSE save offsets might shift together
             ("56 48 83 EC ?? 44 0F 29 44 24 ?? 0F 29 7C 24 ?? 0F 29 34 24", 0),
         ],
     ),
-
     Signature(
         name="EncoderConfigInit2",
         pattern_hex="48 B9 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 48 10 66 C7 40 18 00 00 C6 40 1A 00",
         target_offset=6,
         description="Encoder config constructor 2: mov rcx,packed_qword; mov [rax+0x10],rcx; ...",
         expected_original="00 7D 00 00",
-        patch_bytes="00 D0 07 00",
+        patch_bytes=BITRATE_PATCH_4,
         patch_len=4,
         alt_patterns=[
-            # Struct member offsets might shift
             ("48 B9 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 48 ?? 66 C7 40 ?? 00 00 C6 40 ?? 00", 6),
         ],
     ),
 ]
 
-# endregion Signature Definitions
-
-
-# region Clang Alternate Patterns
-
-# Clang/GCC codegen differences from MSVC:
-#   - Different register allocation (e.g., rdi/rsi for first args instead of rcx/rdx)
-#   - Different prologue sequences (push rbp; mov rbp,rsp vs sub rsp)
-#   - endbr64 prefix (0xF3 0x0F 0x1E 0xFA) on CET-enabled Linux builds
-#   - Different conditional branch encodings
-#   - Different stack alignment padding
-#
-# These patterns are tried AFTER the primary MSVC patterns fail.
-# Each entry: (sig_name, pattern_hex, target_offset)
 CLANG_ALT_PATTERNS = [
-    # EmulateStereoSuccess1 - Clang might use edi instead of ebp for channel count
-    # and different comparison structure
     ("EmulateStereoSuccess1",
      "E8 ?? ?? ?? ?? BF ?? 00 00 00 80 ?? 24 ?? ?? 00 00 01", 6),
-    # Broader: just the channel count mov + cmp [rsp+??], 1
     ("EmulateStereoSuccess1",
      "?? ?? 00 00 00 80 ?? 24 ?? ?? 00 00 01", 1),
-
-    # AudioEncoderOpusConfigSetChannels - Clang may reorder the stores
-    # or use a different mov encoding for the packed constant
     ("AudioEncoderOpusConfigSetChannels",
      "48 B8 14 00 00 00 80 BB 00 00 48 89 ?? 48 C7 ?? ?? ?? 00 00 00", 17),
-    # movabs with different register
     ("AudioEncoderOpusConfigSetChannels",
      "48 ?? 14 00 00 00 80 BB 00 00 48 89 ?? ?? 48 C7 ?? ?? ?? 00 00 00", 18),
-
-    # MonoDownmixer - Clang uses rdi for first arg (SysV ABI) not rcx
     ("MonoDownmixer",
      "48 89 FF E8 ?? ?? ?? ?? 84 C0 74 ?? 83 ?? ?? ?? 00 00 09 0F 8F", 8),
-    # With endbr64 prefix
     ("MonoDownmixer",
      "F3 0F 1E FA ?? 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 ?? ?? ?? 00 00 09 0F 8F", 12),
-
-    # SetsBitrateBitrateValue - Clang may use different src register (edi on SysV)
     ("SetsBitrateBitrateValue",
      "89 F8 48 ?? ?? ?? ?? ?? 01 00 00 00 48 09 ?? 48 89 ?? ??", 4),
     ("SetsBitrateBitrateValue",
      "89 ?? 48 B8 ?? ?? ?? ?? 01 00 00 00 48 09 ?? 48 89 ?? ??", 4),
-
-    # ThrowError - Clang prologue often starts with push rbp; mov rbp,rsp
     ("ThrowError",
      "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 ?? EC ?? ?? 00 00", -1),
-    # endbr64 + standard prologue
     ("ThrowError",
      "F3 0F 1E FA 55 48 89 E5 41 57 41 56 41 55 41 54 53", 3),
-
-    # DownmixFunc - Clang may use different push order
     ("DownmixFunc",
      "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC ?? 45 85 C0", -1),
-    # endbr64 prefix
     ("DownmixFunc",
      "F3 0F 1E FA 55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC ??", 3),
-    # SysV ABI: different register for first param
     ("DownmixFunc",
      "41 57 41 56 41 55 41 54 55 53 48 83 EC ?? 49 89 ?? 45 85 ??", -1),
-
-    # CreateAudioFrameStereo - constant loading may differ
     ("CreateAudioFrameStereo",
      "B8 80 BB 00 00 ?? ?? 00 7D 00 00 0F ?? ??", 31),
-
-    # HighpassCutoffFilter - Clang SSE saves may use different registers/offsets
     ("HighpassCutoffFilter",
      "55 48 89 E5 ?? ?? EC ?? 0F 29 ?? ?? ?? 0F 29 ?? ?? ?? 0F 29", 0),
     ("HighpassCutoffFilter",
      "F3 0F 1E FA 56 48 83 EC ?? ?? 0F 29 ?? ?? ?? 0F 29 ?? ?? ?? 0F 29", 4),
-
-    # EncoderConfigInit2 - same packed constant, different struct offsets
     ("EncoderConfigInit2",
      "48 ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 89 ?? ?? 66 C7 ?? ?? 00 00 C6 ?? ?? 00", 6),
-
-    # -- Linux-specific patterns (SysV ABI / Clang codegen) --------------
-
-    # SetsBitrateBitrateValue - Linux uses rcx (B9) and different mov target
-    # mov reg, reg; movabs rcx, 0x100000000; or rcx, rax; <anything>
     ("SetsBitrateBitrateValue",
      "89 ?? 48 B9 00 00 00 00 01 00 00 00 48 09 C1", 4),
-
-    # CreateAudioFrameStereo - Linux: mov eax,48000 then 4C 0F 43 (cmovnb r12,rax)
-    # wider search for the 64-bit channel cmov after the frequency pair
     ("CreateAudioFrameStereo",
      "B8 80 BB 00 00 41 BD 00 7D 00 00 44 0F 43 E8", 31),
-    # Even broader: just mov eax, 48000 near a 4C 0F 43
     ("CreateAudioFrameStereo",
      "B8 80 BB 00 00 41 ?? 00 7D 00 00 ?? 0F 43 ??", 31),
 ]
-
-# endregion Clang Alternate Patterns
-
-
-# region PE Parser
 
 def parse_pe(data):
     """Extract PE info and compute file offset adjustment dynamically from .text section."""
@@ -544,7 +417,6 @@ ELF_SYMBOL_MAP = {
         "linux_scan": "bitrate_movabs_or",
     },
     "EncoderConfigInit2": {
-        # Same constructor as SetChannels - the 32000 (0x7D00) packed constant
         "patterns": ["AudioEncoderOpusConfigC1Ev", "AudioEncoderOpusConfigC2Ev"],
         "at_start": False,
         "linux_scan": "opus_config_bitrate",
@@ -640,7 +512,6 @@ ARM64_SYMBOL_MAP = {
         "at_start": False,
         "arm64_scan": "arm64_opus_config_init1",
     },
-
     # These are resolved via derivation from arm64 anchors, not direct symbol scan.
     # Entries here allow symbol hints for targeted scanning if needed.
     "EmulateStereoSuccess2": {
@@ -1101,9 +972,9 @@ def _parse_hex_bytes(s):
 # macOS stereo mic patch signatures (x86_64)
 _X86_STEREO = [
     {"n": "MultiChannelOpusConfig_channels", "p": "C7 07 14 00 00 00 48 C7 47 08 01 00 00 00", "t": 10, "o": "01", "x": "02"},
-    {"n": "MultiChannelOpusConfig_bitrate", "p": "48 B8 00 00 00 00 00 7D 00 00 48 89 47 10 66 C7 47 18", "t": 7, "o": "7D 00", "x": "D0 07"},
+    {"n": "MultiChannelOpusConfig_bitrate", "p": "48 B8 00 00 00 00 00 7D 00 00 48 89 47 10 66 C7 47 18", "t": 7, "o": "7D 00", "x": BITRATE_PATCH_3},
     {"n": "OpusConfig_channels", "p": "48 B8 14 00 00 00 80 BB 00 00 48 89 07 48 C7 47 08 01 00 00 00", "t": 17, "o": "01", "x": "02"},
-    {"n": "OpusConfig_bitrate", "p": "48 B8 00 00 00 00 00 7D 00 00 48 89 47 10 C6 47 18 01", "t": 7, "o": "7D 00", "x": "D0 07"},
+    {"n": "OpusConfig_bitrate", "p": "48 B8 00 00 00 00 00 7D 00 00 48 89 47 10 C6 47 18 01", "t": 7, "o": "7D 00", "x": BITRATE_PATCH_3},
     {"n": "StereoDownmixChannels", "p": "66 0F 1F 44 00 00 55 48 89 E5 41 57 41 56 41 54 53 48 89 F3 48 8B 46 28 48 83 F8 02", "t": 6, "o": "55", "x": "C3"},
     {"n": "StereoDownMixFrame", "p": "84 C0 74 18 49 8B 76 18", "t": 2, "o": "74 18", "x": "90 90"},
     {"n": "StereoApplyAudioNetworkAdaptor", "p": "80 7D D8 01 0F 84 9F 00 00 00", "t": 4, "o": "0F 84 9F 00 00 00", "x": "90 90 90 90 90 90"},
@@ -1115,7 +986,7 @@ _X86_STEREO = [
 _ARM64_STEREO = [
     {"n": "MultiChannelOpusConfig_channels", "p": "28 00 80 52", "t": 0, "o": "28", "x": "48", "occ": 1},
     {"n": "OpusConfig_channels", "p": "28 00 80 52", "t": 0, "o": "28", "x": "48", "occ": 2},
-    {"n": "StereoConstBitrate", "p": "00 00 00 00 00 7D 00 00 09", "t": 5, "o": "7D 00", "x": "D0 07", "occ": 1},
+    {"n": "StereoConstBitrate", "p": "00 00 00 00 00 7D 00 00 09", "t": 5, "o": "7D 00", "x": BITRATE_PATCH_3, "occ": 1},
     {"n": "StereoDownmixChannels", "p": "F6 57 BD A9", "t": 0, "o": "F6 57 BD A9", "x": "C0 03 5F D6", "occ": 1},
     {"n": "StereoDownMixFrame", "p": "20 01 00 34", "t": 0, "o": "20 01 00 34", "x": "1F 20 03 D5", "occ": 1},
     {"n": "StereoApplyAudioNetworkAdaptor", "p": "41 01 00 54", "t": 0, "o": "41 01 00 54", "x": "0A 00 00 14", "occ": 1},
@@ -1832,8 +1703,7 @@ def find_offset(data, sig, text_start=0, text_end=None):
 def _topo_sort_derivations(derivations):
     """Sort derivation keys so parents resolve before children.
 
-    This ensures EmulateBitrateModified resolves before
-    DuplicateEmulateBitrateModified which depends on it."""
+    This ensures EmulateBitrateModified resolves before DuplicateEmulateBitrateModified."""
     all_derived = set(derivations.keys())
     order = []
     visited = set()
@@ -1854,27 +1724,53 @@ def _topo_sort_derivations(derivations):
 
 
 def _all_offset_names():
-    """Complete ordered list of all 18 offset names in the exact required order."""
-    return [
-        "CreateAudioFrameStereo",
-        "AudioEncoderOpusConfigSetChannels",
-        "MonoDownmixer",
-        "EmulateStereoSuccess1",
-        "EmulateStereoSuccess2",
-        "EmulateBitrateModified",
-        "SetsBitrateBitrateValue",
-        "SetsBitrateBitwiseOr",
-        "Emulate48Khz",
-        "HighPassFilter",
-        "HighpassCutoffFilter",
-        "DcReject",
-        "DownmixFunc",
-        "AudioEncoderOpusConfigIsOk",
-        "ThrowError",
-        "DuplicateEmulateBitrateModified",
-        "EncoderConfigInit1",
-        "EncoderConfigInit2",
-    ]
+    return list(ALL_OFFSET_NAMES)
+
+
+ALL_OFFSET_NAMES = [
+    "CreateAudioFrameStereo",
+    "AudioEncoderOpusConfigSetChannels",
+    "MonoDownmixer",
+    "EmulateStereoSuccess1",
+    "EmulateStereoSuccess2",
+    "EmulateBitrateModified",
+    "SetsBitrateBitrateValue",
+    "SetsBitrateBitwiseOr",
+    "Emulate48Khz",
+    "HighPassFilter",
+    "HighpassCutoffFilter",
+    "DcReject",
+    "DownmixFunc",
+    "AudioEncoderOpusConfigIsOk",
+    "ThrowError",
+    "DuplicateEmulateBitrateModified",
+    "EncoderConfigInit1",
+    "EncoderConfigInit2",
+]
+
+WINDOWS_PATCHER_OFFSET_NAMES = [
+    "CreateAudioFrameStereo",
+    "AudioEncoderOpusConfigSetChannels",
+    "MonoDownmixer",
+    "EmulateStereoSuccess1",
+    "EmulateStereoSuccess2",
+    "EmulateBitrateModified",
+    "SetsBitrateBitrateValue",
+    "SetsBitrateBitwiseOr",
+    "Emulate48Khz",
+    "HighPassFilter",
+    "HighpassCutoffFilter",
+    "DcReject",
+    "DownmixFunc",
+    "AudioEncoderOpusConfigIsOk",
+    "ThrowError",
+    "EncoderConfigInit1",
+    "EncoderConfigInit2",
+    "BWE_Thr2",
+    "BWE_Thr3",
+]
+
+PATCHER_OFFSET_NAMES = WINDOWS_PATCHER_OFFSET_NAMES
 
 
 def _sliding_window_recover(data, anchor_config, delta, name, adj, bin_fmt='pe'):
@@ -2007,10 +1903,8 @@ def _cross_validate(results, adj, data, tiers_used=None):
     Checks:
       1. Derivation pairs: if both anchor and derived are found independently,
          verify their distance matches the expected delta.
-      2. Encoder config pair: EncoderConfigInit1 and EncoderConfigInit2 should
-         be in different functions but have the same patched field structure.
-      3. Bitrate offsets: all bitrate-related offsets should contain the same
-         default bitrate value (32000 = 0x7D00).
+      2. Encoder config pair: EncoderConfigInit1 and EncoderConfigInit2 (Linux/macOS).
+      3. Bitrate consistency where both EmulateBitrateModified and Duplicate are found.
     """
     warnings = []
     tiers = tiers_used or {}
@@ -2044,19 +1938,16 @@ def _cross_validate(results, adj, data, tiers_used=None):
         if checked_any and not matched_any and mismatch_msg:
             warnings.append(mismatch_msg)
 
-    # Check EncoderConfigInit pair consistency
     if "EncoderConfigInit1" in results and "EncoderConfigInit2" in results:
         for name in ["EncoderConfigInit1", "EncoderConfigInit2"]:
             f = results[name] - adj
             if 0 <= f and f + 4 <= len(data):
                 val = data[f:f+4]
-                if val != b'\x00\x7D\x00\x00' and val != b'\x00\xD0\x07\x00':
+                if val != b'\x00\x7D\x00\x00' and val != b'\x80\x1A\x06\x00':
                     warnings.append(f"{name}: unexpected config bytes {val.hex(' ')} "
-                                    f"(expected 00 7D 00 00 or 00 D0 07 00)")
+                                    f"(expected 00 7D 00 00 or 00 DC 05 00)")
 
-    # Check bitrate consistency (only reliable on PE where both are imul immediates)
     bitrate_names = ["EmulateBitrateModified", "DuplicateEmulateBitrateModified"]
-    # Skip if either was derived via delta - only compare independently-found offsets
     both_independent = all(
         not tiers.get(n, '').startswith('derived') for n in bitrate_names
     )
@@ -2067,7 +1958,6 @@ def _cross_validate(results, adj, data, tiers_used=None):
                 f = results[name] - adj
                 if 0 <= f and f + 3 <= len(data):
                     bitrate_vals[name] = data[f:f+3]
-
         if len(bitrate_vals) == 2:
             vals = list(bitrate_vals.values())
             if vals[0] != vals[1]:
@@ -2077,6 +1967,61 @@ def _cross_validate(results, adj, data, tiers_used=None):
                 )
 
     return warnings
+
+
+BITRATE_OFFSET_NAMES = [
+    "EmulateBitrateModified", "SetsBitrateBitrateValue", "DuplicateEmulateBitrateModified",
+    "EncoderConfigInit1", "EncoderConfigInit2",
+]
+
+def run_bitrate_audit_pe(data, results, adj, text_start, text_end):
+    literal_32000 = struct.pack("<I", 32000)
+    literal_512000 = struct.pack("<I", 512000)
+    bitrate_rvas = set()
+    for name in BITRATE_OFFSET_NAMES:
+        if name in results and results[name]:
+            bitrate_rvas.add(results[name])
+    covered_32k = []
+    uncovered_32k = []
+    covered_512k = []
+    uncovered_512k = []
+    for start in range(text_start, min(text_end, len(data) - 4)):
+        chunk = data[start : start + 4]
+        if chunk == literal_32000:
+            rva = start + adj
+            if any(abs(rva - br) <= 10 for br in bitrate_rvas):
+                covered_32k.append((start, rva))
+            else:
+                uncovered_32k.append((start, rva))
+        elif chunk == literal_512000:
+            rva = start + adj
+            if any(abs(rva - br) <= 10 for br in bitrate_rvas):
+                covered_512k.append((start, rva))
+            else:
+                uncovered_512k.append((start, rva))
+    print("\n" + "=" * 65)
+    print("  BITRATE AUDIT (PE .text)")
+    print("=" * 65)
+    print(f"  Known bitrate patch sites: {len(bitrate_rvas)}")
+    print(f"  32000 (0x7D00):   {len(covered_32k)} covered, {len(uncovered_32k)} uncovered")
+    if uncovered_32k:
+        for f, rva in uncovered_32k[:10]:
+            print(f"    uncovered  file 0x{f:X}  RVA 0x{rva:X}")
+        if len(uncovered_32k) > 10:
+            print(f"    ... and {len(uncovered_32k) - 10} more")
+    print(f"  512000 (0x7D000): {len(covered_512k)} covered, {len(uncovered_512k)} uncovered")
+    if uncovered_512k:
+        for f, rva in uncovered_512k[:10]:
+            print(f"    uncovered  file 0x{f:X}  RVA 0x{rva:X}")
+        if len(uncovered_512k) > 10:
+            print(f"    ... and {len(uncovered_512k) - 10} more")
+        print("  If Discord still reports ~512/529 Kbps, add EncoderConfigInit3 in the patcher:")
+        rva0 = uncovered_512k[0][1]
+        print(f"  In Offsets set:  EncoderConfigInit3 = 0x{rva0:X}")
+    if not uncovered_32k and not uncovered_512k and bitrate_rvas:
+        print("  All 32000/512000 constants in .text are at or near known patch sites.")
+    print()
+    return uncovered_512k[0][1] if uncovered_512k else None
 
 
 def _resolve_arm64_symbols(bin_info, data):
@@ -2209,8 +2154,7 @@ def discover_offsets_arm64(data, arm64_info):
             print(f"  [HINT] {offset_name:45s} function '{safe_sym}' - scan did not match")
 
     # Fallback: if EmulateBitrateModified or DuplicateEmulateBitrateModified still
-    # missing (compiler used literal pool / no MOVZ), scan entire arm64 slice for
-    # 32-bit literal 32000 (0x00007D00) and assign first/second to them.
+    # missing, scan arm64 slice for 32-bit literal 32000 (0x00007D00).
     bitrate_missing = [n for n in ("EmulateBitrateModified", "DuplicateEmulateBitrateModified") if n not in results]
     if bitrate_missing:
         slice_start = fat_offset
@@ -2218,12 +2162,11 @@ def discover_offsets_arm64(data, arm64_info):
         if slice_end > len(data):
             slice_end = len(data)
         literal_32000 = struct.pack('<I', 32000)
-        orig_low3 = b'\x00\x7d\x00'  # low 3 bytes of 32000 (patch writes 00 D0 07)
+        orig_low3 = b'\x00\x7d\x00'
         candidates = []
         for i in range(slice_start, slice_end - 4):
-            if data[i:i + 4] == literal_32000:
-                if data[i:i + 3] == orig_low3:
-                    candidates.append(i)
+            if data[i:i + 4] == literal_32000 and data[i:i + 3] == orig_low3:
+                candidates.append(i)
         if candidates:
             if "EmulateBitrateModified" in bitrate_missing and len(candidates) >= 1:
                 results["EmulateBitrateModified"] = candidates[0] + adj
@@ -2238,7 +2181,16 @@ def discover_offsets_arm64(data, arm64_info):
                 tiers_used["DuplicateEmulateBitrateModified"] = "arm64-literal-32000(only)"
                 print(f"  [SCAN] {'DuplicateEmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000 only]")
 
-    # Report missing
+    fat_offset = arm64_info.get("fat_offset", 0)
+    slice_len = arm64_info.get("fat_size", 0)
+    slice_data = data[fat_offset : fat_offset + slice_len] if slice_len else b""
+    validation_failures = _validate_discovered_offsets(results, slice_data, adj)
+    for name, reason in validation_failures:
+        results.pop(name, None)
+        tiers_used.pop(name, None)
+        errors.append((name, reason))
+        print(f"  [INVALID] {name}: {reason}")
+
     missing = [n for n in _all_offset_names() if n not in results]
     if missing:
         print(f"\n  ARM64 missing offsets ({len(missing)}): {', '.join(missing)}")
@@ -2575,90 +2527,125 @@ def discover_offsets(data, bin_info):
                         expected = bytes.fromhex(exp_hex.replace(' ', ''))
                         actual = data[file_off:file_off+len(expected)]
                         if actual != expected:
-                            continue  # silently skip non-matching candidates
+                            continue
                 print(f"  [HEUR] {name:45s} = 0x{config_off:X}  [{reason}]")
                 results[name] = config_off
                 tiers_used[name] = f"heuristic({reason})"
         else:
             print(f"  No heuristic candidates for: {', '.join(missing)}")
 
+    validation_failures = _validate_discovered_offsets(results, data, adj)
+    for name, reason in validation_failures:
+        results.pop(name, None)
+        tiers_used.pop(name, None)
+        errors.append((name, reason))
+        print(f"  [INVALID] {name}: {reason}")
+
+    if fmt == "pe" and adj:
+        bwe = _discover_bwe_pe(data, adj)
+        for name, rva in bwe.items():
+            if name not in results:
+                results[name] = rva
+                tiers_used[name] = "bwe-scan"
+                print(f"  [BWE ] {name:45s} = 0x{rva:X}  (BuildBitrateTable imm32)")
+
     errors = [(n, e) for n, e in errors if n not in results]
     return results, errors, adj, tiers_used
+
+
+def _discover_bwe_pe(data, adj):
+    """Discover BWE (BuildBitrateTable) offsets for Windows PE. RVA = file_offset + adj."""
+    imm_518400 = struct.pack("<I", 518400)
+    imm_921600 = struct.pack("<I", 921600)
+    preferred_start, preferred_end = 0x43F000, 0x440000
+    thr2_candidates = []
+    thr3_candidates = []
+
+    for start in range(len(data) - 7):
+        if data[start] != 0xC7 or data[start + 1] != 0x40:
+            continue
+        imm = data[start + 3 : start + 7]
+        if imm == imm_518400:
+            thr2_candidates.append(start)
+        elif imm == imm_921600:
+            thr3_candidates.append(start)
+
+    out = {}
+    for cand in thr2_candidates:
+        if preferred_start <= cand < preferred_end:
+            out["BWE_Thr2"] = cand + adj
+            break
+    if "BWE_Thr2" not in out and thr2_candidates:
+        out["BWE_Thr2"] = thr2_candidates[0] + adj
+
+    for cand in thr3_candidates:
+        if preferred_start <= cand < preferred_end:
+            out["BWE_Thr3"] = cand + adj
+            break
+    if "BWE_Thr3" not in out and thr3_candidates:
+        out["BWE_Thr3"] = thr3_candidates[0] + adj
+
+    return out
+
 
 # endregion Offset Discovery Engine
 
 
-# region Validation
-
-# Expected original bytes at each patch site (for verification)
-# Format: (hex_string_or_None, byte_length)
 EXPECTED_ORIGINALS = {
     "EmulateStereoSuccess1":    ("01", 1),
     "EmulateStereoSuccess2":    ("75", 1),
     "Emulate48Khz":             ("0F 42 C1", 3),
-    "EmulateBitrateModified":   (None, 3),      # variable imul immediate
-    "SetsBitrateBitrateValue":  (None, 5),      # variable immediate
+    "EmulateBitrateModified":   (None, 3),
+    "SetsBitrateBitrateValue":  (None, 5),
     "SetsBitrateBitwiseOr":     ("48 09 C1", 3),
-    "HighPassFilter":           (None, 11),      # variable prologue
-    "CreateAudioFrameStereo":   (None, 4),       # cmov variant
+    "HighPassFilter":           (None, 11),
+    "CreateAudioFrameStereo":   (None, 4),
     "AudioEncoderOpusConfigSetChannels": ("01", 1),
     "AudioEncoderOpusConfigIsOk": ("8B 11 31 C0", 4),
     "MonoDownmixer":            ("84 C0 74 0D", 4),
     "ThrowError":               ("41", 1),
     "DownmixFunc":              ("41", 1),
-    "HighpassCutoffFilter":     (None, 0x100),   # full function body
-    "DcReject":                 (None, 0x1B6),   # full function body
-    "DuplicateEmulateBitrateModified": (None, 3), # variable imul immediate
+    "HighpassCutoffFilter":     (None, 0x100),
+    "DcReject":                 (None, 0x1B6),
+    "DuplicateEmulateBitrateModified": (None, 3),
     "EncoderConfigInit1":       ("00 7D 00 00", 4),
     "EncoderConfigInit2":       ("00 7D 00 00", 4),
 }
 
-# Linux/Clang builds have different prologue and instruction encodings.
-# When binary format is ELF, these override EXPECTED_ORIGINALS.
 EXPECTED_ORIGINALS_CLANG = {
-    # Universal Clang differences from MSVC (apply to BOTH macOS and Linux):
-    "DownmixFunc":              ("55", 1),       # push rbp (not push r14)
-    "AudioEncoderOpusConfigIsOk": ("55 48 89 E5", 4),  # push rbp; mov rbp,rsp
-    "Emulate48Khz":             (None, 3),       # Clang uses different encoding (no cmovb here)
-    "HighpassCutoffFilter":     (None, 0x100),   # Clang prologue differs
-    "DcReject":                 (None, 0x1B6),   # Clang prologue differs
+    "DownmixFunc":              ("55", 1),
+    "AudioEncoderOpusConfigIsOk": ("55 48 89 E5", 4),
+    "Emulate48Khz":             (None, 3),
+    "HighpassCutoffFilter":     (None, 0x100),
+    "DcReject":                 (None, 0x1B6),
 }
 
-# Linux-ONLY differences from both Windows AND macOS.
-# These are logic inversions specific to the Linux build, not just Clang vs MSVC.
 EXPECTED_ORIGINALS_LINUX_ONLY = {
-    "EmulateStereoSuccess1":    ("00", 1),       # cmp byte[...], 0 (inverted from Win/macOS)
-    "EmulateStereoSuccess2":    ("74", 1),       # je (not jne as on Win/macOS)
-    "CreateAudioFrameStereo":   ("4C 0F 43", 4), # cmovnb r12, rax (E0 not E8)
+    "EmulateStereoSuccess1":    ("00", 1),
+    "EmulateStereoSuccess2":    ("74", 1),
+    "CreateAudioFrameStereo":   ("4C 0F 43", 4),
 }
 
-# macOS-ONLY differences (where macOS diverges from BOTH Windows and Linux).
-# CreateAudioFrameStereo: verified in discord_voice - MacOS Unpatched.node at file 0xa1e34a
-# (cmovnb r12, rax = 4C 0F 43 E0; Linux uses r13 = E8).
 EXPECTED_ORIGINALS_MACHO_ONLY = {
-    "ThrowError":               ("55", 1),       # push rbp (macOS); Linux/Win both use 0x41
+    "ThrowError":               ("55", 1),
     "CreateAudioFrameStereo":   ("4C 0F 43 E0", 4),
 }
 
-# ARM64-specific expected originals.
-# For function-start offsets the first instruction varies (STP, SUB sp, etc.)
-# so we use None. For instruction-level offsets we verify the MOVZ encoding.
 EXPECTED_ORIGINALS_ARM64 = {
-    "ThrowError":               (None, 4),       # variable prologue (STP/SUB sp)
-    "DownmixFunc":              (None, 4),       # variable prologue
-    "HighpassCutoffFilter":     (None, 4),       # variable prologue
-    "DcReject":                 (None, 4),       # variable prologue
-    "HighPassFilter":           (None, 4),       # variable prologue
-    "AudioEncoderOpusConfigSetChannels": (None, 4),  # MOVZ wN, #1 (register varies)
-    "CreateAudioFrameStereo":   (None, 4),       # MOVZ wN, #1 (register varies)
-    "EmulateStereoSuccess1":    (None, 4),       # LDRB (offset varies)
-    "MonoDownmixer":            (None, 4),       # CBZ/CBNZ (register varies)
-    "EncoderConfigInit2":       (None, 4),       # MOVZ wN, #32000 (register varies)
+    "ThrowError":               (None, 4),
+    "DownmixFunc":              (None, 4),
+    "HighpassCutoffFilter":     (None, 4),
+    "DcReject":                 (None, 4),
+    "HighPassFilter":           (None, 4),
+    "AudioEncoderOpusConfigSetChannels": (None, 4),
+    "CreateAudioFrameStereo":   (None, 4),
+    "EmulateStereoSuccess1":    (None, 4),
+    "MonoDownmixer":            (None, 4),
+    "EncoderConfigInit2":       (None, 4),
 }
 
 
 def _build_expected_map(fmt, arch=None):
-    """Build the expected-bytes map for a given binary format."""
     if arch == 'arm64':
         return dict(EXPECTED_ORIGINALS_ARM64)
     m = dict(EXPECTED_ORIGINALS)
@@ -2675,8 +2662,8 @@ PATCH_INFO = {
     "EmulateStereoSuccess1":    ("02", "Channel count 1->2"),
     "EmulateStereoSuccess2":    ("EB", "jne->jmp (force stereo)"),
     "Emulate48Khz":             ("90 90 90", "cmovb->NOPs (force 48kHz)"),
-    "EmulateBitrateModified":   ("00 D0 07", "imul 32000->512000 bps"),
-    "SetsBitrateBitrateValue":  ("00 D0 07 00 00", "512000 in imm64"),
+    "EmulateBitrateModified":   (BITRATE_PATCH_3, "imul 32000->384000 bps"),
+    "SetsBitrateBitrateValue":  (BITRATE_PATCH_5, "384000 in imm64"),
     "SetsBitrateBitwiseOr":     ("90 90 90", "or rcx,rax->NOPs"),
     "HighPassFilter":           ("<dynamic: mov rax, IMAGE_BASE+HPC; ret>", "Redirect to HPC"),
     "CreateAudioFrameStereo":   ("49 89 C5 90", "cmovae->mov r13,rax; nop"),
@@ -2687,9 +2674,9 @@ PATCH_INFO = {
     "DownmixFunc":              ("C3", "ret (disable downmix)"),
     "HighpassCutoffFilter":     ("<injected: hp_cutoff>", "Custom HP cutoff + gain"),
     "DcReject":                 ("<injected: dc_reject>", "Custom DC reject + gain"),
-    "DuplicateEmulateBitrateModified": ("00 D0 07", "Dup imul 32000->512000"),
-    "EncoderConfigInit1":       ("00 D0 07 00", "Config qword: 32000->512000"),
-    "EncoderConfigInit2":       ("00 D0 07 00", "Config qword: 32000->512000"),
+    "DuplicateEmulateBitrateModified": (BITRATE_PATCH_3, "Dup imul 32000->384000"),
+    "EncoderConfigInit1":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
+    "EncoderConfigInit2":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
 }
 
 
@@ -2817,57 +2804,154 @@ def format_powershell_config(results, bin_info=None, file_path=None, file_size=N
     for name in ordered:
         pad = " " * (max_len - len(name))
         if name in results:
-            if fmt != 'pe':
-                file_off = results[name] - adj
-                lines.append(f"        {name}{pad} = 0x{results[name]:X}  # file_offset=0x{file_off:X}")
-            else:
-                lines.append(f"        {name}{pad} = 0x{results[name]:X}")
+            lines.append(f"        {name}{pad} = 0x{results[name]:X}")
         else:
-            lines.append(f"        {name}{pad} = 0x0  # NOT FOUND")
+            lines.append(f"        {name}{pad} = 0x0")
 
     lines.append("    }")
     return "\n".join(lines)
 
 
-def format_windows_patcher_block(results, bin_info, file_path, file_size):
-    """Generate full Windows patcher offset region for copy-paste into Discord_voice_node_patcher.ps1.
-    Includes OffsetsMeta (Build, Size, MD5) and Offsets table. Values are config RVA for PE."""
+def _validate_discovered_offsets(results, data, adj, margin=512):
+    invalid = []
+    n = len(data)
+    for name, rva in list(results.items()):
+        if rva == 0:
+            invalid.append((name, "offset is zero (invalid)"))
+            continue
+        file_off = rva - adj
+        if file_off < 0:
+            invalid.append((name, "file offset is negative"))
+            continue
+        if file_off >= n - margin:
+            invalid.append((name, f"0x{rva:X} (file 0x{file_off:X}) out of file bounds"))
+            continue
+    invalid_names = {x for x, _ in invalid}
+    rva_to_names = {}
+    for name, rva in results.items():
+        if name in invalid_names:
+            continue
+        rva_to_names.setdefault(rva, []).append(name)
+    for rva, names in rva_to_names.items():
+        if len(names) > 1:
+            for name in names[1:]:
+                invalid.append((name, f"duplicate RVA 0x{rva:X} (same as {names[0]})"))
+    return invalid
+
+
+def _validate_pe_offsets_for_patcher(results, bin_info, file_size):
+    if not bin_info or file_size is None:
+        return False, "missing bin_info or file_size"
+    adj = bin_info.get("file_offset_adjustment", 0xC00)
+    required = set(PATCHER_OFFSET_NAMES)
+    if required - set(results):
+        return False, "missing required offsets"
+    seen_rva = set()
+    for name in PATCHER_OFFSET_NAMES:
+        rva = results[name]
+        if rva == 0:
+            return False, f"{name} is zero"
+        if rva in seen_rva:
+            return False, f"duplicate RVA 0x{rva:X}"
+        seen_rva.add(rva)
+        file_off = rva - adj
+        if file_off < 0 or file_off >= file_size - 512:
+            return False, f"{name} (0x{rva:X}) out of file bounds"
+    return True, None
+
+
+WINDOWS_PATCHER_OFFSET_ORDER = list(WINDOWS_PATCHER_OFFSET_NAMES)
+
+_MONTHS_ASCII = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def format_windows_patcher_block(results, bin_info, file_path, file_size, optional_encoder_config_init3=None):
     if not bin_info or not file_path or file_size is None:
         return None
     fmt = bin_info.get('format', 'raw')
     if fmt != 'pe':
         return None
-    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
-    build_str = bin_info['build_time'].strftime('%b %d %Y') if 'build_time' in bin_info else 'PE binary'
+    ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
+    if not ok:
+        return None
+    with open(file_path, 'rb') as f:
+        md5 = hashlib.md5(f.read()).hexdigest().lower()
+    if bin_info.get('build_time') and hasattr(bin_info['build_time'], 'month'):
+        bt = bin_info['build_time']
+        build_str = "%s %d %d" % (_MONTHS_ASCII[bt.month - 1], bt.day, bt.year)
+    else:
+        build_str = "PE binary"
     lines = [
         "# region Offsets (PASTE HERE)",
-        "#",
-        "# This patcher uses ONE offsets table.",
-        "# When Discord updates and your offset finder produces new values, paste them here.",
-        "#",
-        "# Tip: keep the MD5/Size in OffsetsMeta updated too. If it doesn't match the downloaded",
-        "# discord_voice.node, the script will stop early with a clear message instead of failing",
-        "# later with a confusing \"Binary validation failed\".",
-        "#",
+        "",
         "$Script:OffsetsMeta = @{",
-        f'    FinderVersion = "discord_voice_node_offset_finder.py v{VERSION}"',
-        f'    Build         = "{build_str}"',
-        f"    Size          = {file_size}",
-        f'    MD5           = "{md5}"',
+        '    FinderVersion = "discord_voice_node_offset_finder.py v%s"' % VERSION,
+        '    Build         = "%s"' % build_str,
+        "    Size          = %s" % file_size,
+        '    MD5           = "%s"' % md5,
         "}",
         "",
         "$Script:Offsets = @{",
     ]
-    ordered = _all_offset_names()
-    max_len = max(len(n) for n in ordered)
+    ordered = WINDOWS_PATCHER_OFFSET_ORDER
+    max_len = max((len(n) for n in ordered), default=0)
     for name in ordered:
+        if name not in results:
+            continue
         pad = " " * (max_len - len(name))
-        val = f"0x{results[name]:X}" if name in results else "0x0  # NOT FOUND"
-        lines.append(f"    {name}{pad} = {val}")
+        val = "0x%X" % results[name]
+        lines.append("    %s%s = %s" % (name, pad, val))
     lines.append("}")
     lines.append("")
     lines.append("# endregion Offsets")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
+
+
+PATCHER_DEBUG_GROUPS = {
+    "STEREO": [
+        ("EmulateStereoSuccess1", "EmulateStereoSuccess1 (channels=2)"),
+        ("EmulateStereoSuccess2", "EmulateStereoSuccess2 (jne->jmp)"),
+        ("CreateAudioFrameStereo", "CreateAudioFrameStereo"),
+        ("AudioEncoderOpusConfigSetChannels", "AudioEncoderConfigSetChannels (ch=2)"),
+        ("MonoDownmixer", "MonoDownmixer (NOP sled + JMP)"),
+    ],
+    "BITRATE": [
+        ("EmulateBitrateModified", "EmulateBitrateModified (384kbps)"),
+        ("SetsBitrateBitrateValue", "SetsBitrateBitrateValue (384kbps)"),
+        ("SetsBitrateBitwiseOr", "SetsBitrateBitwiseOr (NOP)"),
+    ],
+    "SAMPLERATE": [
+        ("Emulate48Khz", "Emulate48Khz (NOP cmovb)"),
+    ],
+    "FILTER": [
+        ("HighPassFilter", "HighPassFilter (RET stub)"),
+        ("HighpassCutoffFilter", "HighpassCutoffFilter (inject hp_cutoff)"),
+        ("DcReject", "DcReject (inject dc_reject)"),
+        ("DownmixFunc", "DownmixFunc (RET)"),
+        ("AudioEncoderOpusConfigIsOk", "AudioEncoderConfigIsOk (RET true)"),
+        ("ThrowError", "ThrowError (RET)"),
+    ],
+    "ENCODER": [
+        ("EncoderConfigInit1", "EncoderConfigInit1 (32000->384000)"),
+        ("EncoderConfigInit2", "EncoderConfigInit2 (32000->384000)"),
+    ],
+    "BWE_384": [
+        ("BWE_Thr2", "BWE_Thr2 (518400->384000)"),
+        ("BWE_Thr3", "BWE_Thr3 (921600->384000)"),
+    ],
+}
+
+
+def format_windows_debug_mode(results=None):
+    """Format patch names only for patcher Debug Mode."""
+    lines = []
+    for group_name, patches in PATCHER_DEBUG_GROUPS.items():
+        lines.append(f"  [{group_name}]")
+        for key, _ in patches:
+            lines.append(f"    {key}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def format_linux_patcher_block(results, bin_info, file_path, file_size):
@@ -2895,7 +2979,7 @@ def format_linux_patcher_block(results, bin_info, file_path, file_size):
             file_off = results[name] - adj
             lines.append(f"OFFSET_{name}=0x{file_off:X}")
         else:
-            lines.append(f"OFFSET_{name}=0x0  # NOT FOUND")
+            lines.append(f"OFFSET_{name}=0x0")
     lines.append("FILE_OFFSET_ADJUSTMENT=0")
     return "\n".join(lines)
 
@@ -2925,7 +3009,7 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size):
             file_off = fat_offset + slice_off
             lines.append(f"    [{name}]=0x{file_off:X}")
         else:
-            lines.append(f"    [{name}]=0x0  # NOT FOUND")
+            lines.append(f"    [{name}]=0x0")
     lines.append(")")
     lines.append("FILE_OFFSET_ADJUSTMENT=0")
     return "\n".join(lines)
@@ -2972,7 +3056,7 @@ def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
     if fmt == 'macho' and 'stereo_patches' in bin_info:
         out["stereo_patches"] = bin_info["stereo_patches"]
 
-    return json.dumps(out, indent=2)
+    return json.dumps(out, indent=2, ensure_ascii=True)
 
 # endregion Output Formatters
 
@@ -3284,6 +3368,17 @@ def main():
     verified, warnings = validate_offsets(data, results, adj, bin_fmt=fmt)
     check_injection_sites(data, results, adj)
 
+    encoder_config_init3_rva = None
+    if fmt == 'pe':
+        ts = bin_info.get('text_section')
+        if ts:
+            t_start = ts['raw_offset']
+            t_end = ts['raw_offset'] + ts['raw_size']
+        else:
+            t_start = 0
+            t_end = len(data)
+        encoder_config_init3_rva = run_bitrate_audit_pe(data, results, adj, t_start, t_end)
+
     # --- Cross-validation ------------------------------------------
     xval_warnings = _cross_validate(results, adj, data, tiers_used=tiers_used)
     if xval_warnings:
@@ -3324,7 +3419,12 @@ def main():
     print("  RESULTS SUMMARY")
     print("=" * 65)
     print(f"  Format:           {fmt.upper()} ({arch})")
-    print(f"  x86_64 found:     {len(results)} / 18")
+    if fmt == 'pe':
+        patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+        print(f"  Windows patcher:   {patcher_count} / {len(PATCHER_OFFSET_NAMES)}  (required for Discord_voice_node_patcher.ps1)")
+        print(f"  x86_64 discovered: {len(results)} offsets")
+    else:
+        print(f"  x86_64 found:      {len(results)} / 18")
     print(f"  Bytes verified:   {verified}")
     print(f"  Warnings:         {warnings}")
     print(f"  Cross-validation: {len(xval_warnings)} issue(s)" if xval_warnings else "  Cross-validation: clean")
@@ -3365,25 +3465,37 @@ def main():
 
     # --- Output ----------------------------------------------------
     if results:
-        ps_config = format_powershell_config(results, bin_info, file_path, file_size)
-        print("\n" + "=" * 65)
-        print("  PATCHER OFFSET TABLE (copy-paste into patcher)")
-        print("=" * 65)
-        print(ps_config)
-
-        # Platform-specific copy-paste blocks for patchers
+        # For Windows (PE), print the exact patcher block first so users copy the right thing
         if fmt == 'pe':
-            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
+            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size, optional_encoder_config_init3=encoder_config_init3_rva)
+            if not win_block and bin_info and file_size is not None:
+                ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
+                if not ok:
+                    print(f"\n  [WARN] Windows patcher block skipped: {err}")
             if win_block:
                 print("\n" + "=" * 65)
                 print("  COPY BELOW -> Discord_voice_node_patcher.ps1")
-                print("  Replace the entire # region Offsets ... # endregion Offsets section")
+                print("  Replace the entire # region Offsets (PASTE HERE) ... # endregion Offsets section")
                 print("=" * 65)
                 print("")
                 print("--- BEGIN COPY (Windows) ---")
-                print(win_block)
+                print(win_block, end="")
                 print("--- END COPY ---")
                 print("")
+                print("  DEBUG MODE (matches patcher GUI groups)")
+                print("  " + "-" * 60)
+                print(format_windows_debug_mode(results))
+                print("")
+
+        if fmt != 'pe':
+            ps_config = format_powershell_config(results, bin_info, file_path, file_size)
+            print("\n" + "=" * 65)
+            print("  PATCHER OFFSET TABLE (copy-paste into patcher)")
+            print("=" * 65)
+            print(ps_config)
+
+        if fmt == 'pe':
+            pass
         elif fmt == 'elf':
             linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
             if linux_block:
@@ -3419,7 +3531,7 @@ def main():
                     file_off = results[name] - adj
                     print(f"        {name}{pad} = 0x{file_off:X}")
                 else:
-                    print(f"        {name}{pad} = 0x0  # NOT FOUND")
+                    print(f"        {name}{pad} = 0x0")
             print("    }")
 
         stub_line = ""
@@ -3471,13 +3583,17 @@ def main():
                     fat_off = arm64_fat_off + file_off
                     print(f"        {name}{pad} = 0x{fat_off:X}  # slice_off=0x{file_off:X}")
                 else:
-                    print(f"        {name}{pad} = 0x0  # NOT FOUND")
+                    print(f"        {name}{pad} = 0x0")
             print("    }")
 
         # Save offsets.txt
         script_dir = Path(__file__).resolve().parent
-        file_content = [ps_config]
-        if fmt != 'pe':
+        if fmt == 'pe':
+            wb = format_windows_patcher_block(results, bin_info, file_path, file_size)
+            file_content = [wb] if wb else []
+        else:
+            ps_config = format_powershell_config(results, bin_info, file_path, file_size)
+            file_content = [ps_config]
             file_content.append("\n# x86_64 file offsets for direct binary patching:")
             for name in _all_offset_names():
                 if name in results:
@@ -3495,7 +3611,7 @@ def main():
         for try_dir in [script_dir, file_path.parent, Path.cwd()]:
             try:
                 out_path = try_dir / "offsets.txt"
-                out_path.write_text("\n".join(file_content))
+                out_path.write_text("\n".join(file_content), encoding="ascii")
                 print(f"\n  Offset file saved: {out_path}")
                 break
             except Exception:
@@ -3525,7 +3641,7 @@ def main():
                     json_text = _json.dumps(jdata, indent=2)
                 except Exception:
                     pass
-            json_path.write_text(json_text)
+            json_path.write_text(json_text, encoding="ascii")
             print(f"  JSON saved: {json_path}")
         except Exception:
             pass
@@ -3533,6 +3649,19 @@ def main():
     # --- Exit code -------------------------------------------------
     total_x86 = len(results)
     total_arm64 = len(arm64_results) if arm64_results else -1
+    patcher_ok = all(k in results for k in PATCHER_OFFSET_NAMES) if results else False
+
+    n_patcher = len(PATCHER_OFFSET_NAMES)
+    if fmt == 'pe':
+        if patcher_ok:
+            print(f"\n  *** ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND ***")
+            return 0
+        got = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+        if got > 0:
+            print(f"\n  *** PARTIAL: {got}/{n_patcher} Windows patcher offsets ***")
+            return 1
+        print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_patcher} ***")
+        return 2
     if total_x86 == 18:
         msg = "*** ALL 18 x86_64 OFFSETS FOUND SUCCESSFULLY ***"
         if total_arm64 >= 0:
