@@ -3,7 +3,7 @@
 **Automated signature-based offset discovery for `discord_voice.node` binary patching**
 
 ![Python](https://img.shields.io/badge/Python-3.6+-3776AB?style=flat-square)
-![Offsets](https://img.shields.io/badge/Offsets-18-5865F2?style=flat-square)
+![Offsets](https://img.shields.io/badge/Offsets-19%20%28Win%29-5865F2?style=flat-square)
 ![Signatures](https://img.shields.io/badge/Signatures-9-00C853?style=flat-square)
 
 > **Full transparency:** I am not a Python developer... in fact i SUCK at python — I'm pretty good at ps1 and familiar with most of c++. The offset research, signature design, and binary analysis are a collection of My, Cypher, Shaun, and Oracle's determination; the actual Python implementation was written almost entirely by Claude (Anthropic). If the code is clean, that's Claude. If the signatures are clever, that's us. If something is broken, it's probably both of our faults lol!
@@ -50,7 +50,7 @@
   - [Console Output](#console-output)
   - [offsets.txt](#offsetstxt)
   - [JSON](#json)
-  - [PowerShell Config Block](#powershell-config-block)
+  - [Windows Patcher Paste Block](#windows-patcher-paste-block)
   - [C++ Namespace Block](#c-namespace-block)
 - [Auto-Detection](#auto-detection)
 - [Exit Codes](#exit-codes)
@@ -62,11 +62,11 @@
 
 ## Overview
 
-The offset finder locates 18 specific code locations inside Discord's native voice module (`discord_voice.node`) that the companion PowerShell patcher needs to modify. Rather than hardcoding raw addresses that break every time Discord ships a new build, the finder uses **byte-pattern signatures** that survive recompilation, combined with **relative offset derivation** to reach nearby patch sites from a single anchor.
+The offset finder locates the code locations inside Discord's native voice module (`discord_voice.node`) that the companion PowerShell patcher needs to modify. **On Windows, the patcher expects 19 offsets** (including EncoderConfigInit1/2 and BWE_Thr2/Thr3). Rather than hardcoding raw addresses that break every time Discord ships a new build, the finder uses **byte-pattern signatures** that survive recompilation, combined with **relative offset derivation** and **BWE discovery** (518400/921600 imm32) to reach all patch sites.
 
-The tool is designed so that when Discord ships a new `discord_voice.node`, a developer can run it against the new binary. If all 18 offsets resolve, the existing patcher works as-is — just swap the offset table. If signatures break, the console output tells you exactly which ones failed and why, so you know where to focus your reverse engineering.
+The tool is designed so that when Discord ships a new `discord_voice.node`, a developer can run it against the new binary. If all 19 Windows patcher offsets resolve, the existing patcher works as-is — just paste the generated block into the patcher's offset region. If signatures break, the console output tells you exactly which ones failed and why.
 
-The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Windows (PE), Linux (ELF), and macOS (Mach-O); it uses **9** anchor signatures to derive the same 18 offsets. **On current Discord builds, the finder resolves all 18 offsets on Windows, Linux, and macOS.**
+The **v5** finder uses a tiered resolution pipeline and supports Windows (PE), Linux (ELF), and macOS (Mach-O). It uses **9** anchor signatures to derive offsets; on Windows it also discovers BWE_Thr2 and BWE_Thr3 by scanning for the 518400/921600 immediates. **On current Discord builds, the finder resolves all 19 Windows patcher offsets.** Linux/macOS patcher lists may use a different count (e.g. 18).
 
 ---
 
@@ -89,12 +89,12 @@ The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Wi
 └──────────────────────────┘                │
                                             ▼
 ┌──────────────────────────┐     ┌──────────────────────┐
-│  Phase 2: Derivation     │────▶│ +9 derived offsets   │
-│  (anchor + delta)        │     └──────────┬───────────┘
-└──────────────────────────┘                │
+│  Phase 2: Derivation      │────▶│ + derived offsets    │
+│  (anchor + delta)         │     │ + BWE (Win)          │
+└──────────────────────────┘     └──────────┬───────────┘
                                             ▼
 ┌──────────────────────────┐     ┌──────────────────────┐
-│  Phase 3: Verification   │────▶│ 18 verified offsets  │
+│  Phase 3: Verification   │────▶│ 19 (Win) verified     │
 │  (expected original bytes)│     └──────────┬───────────┘
 └──────────────────────────┘                │
                                             ▼
@@ -104,7 +104,7 @@ The **v5** finder uses a tiered resolution pipeline (Tier 0–6) and supports Wi
 └──────────────────────────┘                │
                                             ▼
                                    offsets.txt / .json
-                                   PowerShell config
+                                   Windows patcher block
                                    C++ namespace
 ```
 
@@ -135,7 +135,7 @@ The console stays open after completion (press Enter to close) so you can read t
 
 ## GUI
 
-A graphical interface is provided by **`offset_finder_gui.py`** in the same directory. Run it (e.g. `python offset_finder_gui.py`) to select a `discord_voice.node` file, run the finder, and view colorized output. The GUI auto-loads the offset finder script from the same folder (e.g. `discord_voice_node_offset_finder_v5.py`) and uses a dark theme to match the Stereo Installer. Credits for the GUI: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher.
+A graphical interface is provided by **`offset_finder_gui.py`** in the same directory. Run it (e.g. `python offset_finder_gui.py`) to select a `discord_voice.node` file, run the finder, and view colorized output. The GUI auto-loads the offset finder script from the same folder (e.g. `discord_voice_node_offset_finder_v5.py`) and uses a dark theme to match the Stereo Installer. **Copy Block** copies the Windows patcher paste block (region + OffsetsMeta + Offsets + endregion) for pasting into the patcher. The debug section shows **patch names only** (one per line per group), matching the patcher's Debug mode labels. Credits for the GUI: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher.
 
 ---
 
@@ -164,13 +164,13 @@ If a signature fails (e.g., the binary is already patched), the tool may attempt
 
 ### Phase 2: Relative Offset Derivation
 
-Nine of the 18 offsets are derived by adding a **fixed delta** to an anchor found in Phase 1. These deltas have been verified stable across multiple builds (Jul 2025 through Feb 2026) because the derived offsets live in the same function or the same compilation unit as their anchor — the compiler preserves their relative positions even when absolute addresses shift.
+Many of the 19 Windows offsets are derived by adding a **fixed delta** to an anchor found in Phase 1. These deltas have been verified stable across multiple builds (Jul 2025 through Feb 2026) because the derived offsets live in the same function or the same compilation unit as their anchor — the compiler preserves their relative positions even when absolute addresses shift. On Windows, **BWE_Thr2** and **BWE_Thr3** are discovered by scanning for 518400 and 921600 (little-endian imm32) in the BuildBitrateTable region, not by derivation.
 
 ```
 Derived Offset = Anchor Offset + Delta
 ```
 
-Deltas are defined in the script and are stable when the derived site lives in the same function or compilation unit as the anchor. If an anchor wasn't found in Phase 1, all its dependents are skipped (not silently — the console reports `[SKIP] ... anchor not found`).
+If an anchor wasn't found in Phase 1, all its dependents are skipped (not silently — the console reports `[SKIP] ... anchor not found`).
 
 ### Phase 3: Byte Verification
 
@@ -198,7 +198,7 @@ If `Margin < 0`, the injection would overwrite the next function. The check exis
 
 ## Offsets (source of truth)
 
-The finder discovers a fixed set of patch offsets: some are found directly by signatures (anchors), others are derived from anchors by adding deltas. The exact names, count, and derivation chain are defined in the script and may change with new Discord builds. Run the finder or inspect `discord_voice_node_offset_finder_v5.py` (e.g. `SIGNATURES`, `DERIVATIONS`, `EXPECTED_ORIGINALS`) for the current list. When an anchor fails, its dependents are skipped and reported in the console.
+The finder discovers a fixed set of patch offsets: some are found directly by signatures (anchors), others are derived from anchors by adding deltas, and on Windows **BWE_Thr2** and **BWE_Thr3** are found by scanning for 518400/921600 immediates. The exact names, count, and derivation chain are defined in the script. The **Windows patcher list** (`WINDOWS_PATCHER_OFFSET_NAMES`) has **19** names and matches the order and keys expected by `Discord_voice_node_patcher.ps1`. Run the finder or inspect `discord_voice_node_offset_finder_v5.py` (e.g. `SIGNATURES`, `DERIVATIONS`, BWE discovery, `EXPECTED_ORIGINALS`) for the current list. When an anchor fails, its dependents are skipped and reported in the console.
 
 ---
 
@@ -267,18 +267,21 @@ Full diagnostic log with color-coded status markers:
 [ OK ] — Offset found and verified
 [FAIL] — Signature matched nothing or was ambiguous
 [FALL] — Found via patched-binary fallback
+[BWE ] — BWE_Thr2/Thr3 found via imm32 scan (Windows)
 [PASS] — Original bytes match expected
 [WARN] — Bytes don't match (possibly already patched)
 [INFO] — No fixed expected bytes; showing what's there
 [SKIP] — Anchor missing, derivation skipped
 ```
 
+Success line for Windows: **ALL 19 WINDOWS PATCHER OFFSETS FOUND**.
+
 ### offsets.txt
 
 Saved next to the script (fallback: next to the binary, then CWD). Contains:
 
 1. File metadata (build date, size, MD5)
-2. Copy-paste PowerShell config block
+2. Windows patcher paste block (region + OffsetsMeta + Offsets + endregion)
 3. HighPassFilter stub bytes
 4. C++ namespace block
 
@@ -297,27 +300,25 @@ Saved as `<input_file>.offsets.json`. Machine-readable format:
   "image_base": "0x180000000",
   "file_offset_adjustment": "0xc00",
   "offsets": {
-    "AudioEncoderOpusConfigIsOk": "0x3A7610",
-    "AudioEncoderOpusConfigSetChannels": "0x3A7374",
+    "AudioEncoderOpusConfigIsOk": "0x3A7540",
+    "AudioEncoderOpusConfigSetChannels": "0x3A72A4",
+    "BWE_Thr2": "0x44005B",
+    "BWE_Thr3": "0x44006A",
     ...
   },
-  "total_found": 18,
-  "total_expected": 18
+  "total_found": 19,
+  "total_expected": 19
 }
 ```
 
-### PowerShell Config Block
+### Windows Patcher Paste Block
 
-Drop-in replacement for the patcher's `Offsets = @{ ... }` hashtable:
+The finder outputs a block that **replaces the entire** `# region Offsets (PASTE HERE)` … `# endregion Offsets` section in `Discord_voice_node_patcher.ps1`:
 
-```powershell
-    Offsets = @{
-        EmulateStereoSuccess1             = 0x53840B
-        EmulateStereoSuccess2             = 0x538417
-        Emulate48Khz                      = 0x538573
-        ...
-    }
-```
+- `$Script:OffsetsMeta = @{ FinderVersion = "…"; Build = "…"; Size = …; MD5 = "…" }`
+- `$Script:Offsets = @{ CreateAudioFrameStereo = 0x…; … }` (all 19 keys in patcher order)
+
+Copy the block between `--- BEGIN COPY (Windows) ---` and `--- END COPY ---` and paste into the patcher. No manual editing of key order is needed. The GUI **Copy Block** button copies this same block (without the BEGIN/END markers) to the clipboard.
 
 ### C++ Namespace Block
 
@@ -325,8 +326,10 @@ For reference or for embedding in a standalone C++ patcher:
 
 ```cpp
 namespace Offsets {
-    constexpr uint32_t AudioEncoderOpusConfigIsOk = 0x3A7610;
-    constexpr uint32_t AudioEncoderOpusConfigSetChannels = 0x3A7374;
+    constexpr uint32_t AudioEncoderOpusConfigIsOk = 0x3A7540;
+    constexpr uint32_t AudioEncoderOpusConfigSetChannels = 0x3A72A4;
+    constexpr uint32_t BWE_Thr2 = 0x44005B;
+    constexpr uint32_t BWE_Thr3 = 0x44006A;
     ...
     constexpr uint32_t FILE_OFFSET_ADJUSTMENT = 0xC00;
 };
@@ -347,19 +350,19 @@ On Windows, if no file path is provided, the script searches standard Discord in
 
 It picks the latest `app-*` directory (sorted descending) and the first matching voice module. This works for stock Discord; mod clients (BetterDiscord, Vencord, etc.) share the same install path.
 
-**Auto-detection of the install path is Windows-only.** On Linux and macOS, pass the path to `discord_voice.node` explicitly. **Offset discovery itself is cross-platform:** the finder resolves all 18 offsets on current builds on Windows, Linux, and macOS when given the binary.
+**Auto-detection of the install path is Windows-only.** On Linux and macOS, pass the path to `discord_voice.node` explicitly. **Offset discovery itself is cross-platform:** the finder resolves all 19 Windows patcher offsets on current builds when given the Windows binary.
 
 ---
 
 ## Exit Codes
 
 | Code | Meaning | Threshold |
-|------|---------|-----------|
-| `0` | All 18 offsets found | 18/18 |
-| `1` | Partial success — enough for basic patching | 15-17/18 |
-| `2` | Insufficient — too many missing for safe patching | < 15/18 |
+|------|---------|------------|
+| `0` | All required offsets found (Windows: 19/19 patcher offsets) | 19/19 (Win) |
+| `1` | Partial success — enough for basic patching | 16–18/19 (Win) |
+| `2` | Insufficient — too many missing for safe patching | < 16/19 (Win) |
 
-The thresholds are intentionally conservative. Partial success allows the patcher to still function at reduced effectiveness when a few offsets are missing (e.g. some bitrate defaults may leak through on certain code paths). See the script for the exact counts and thresholds.
+The thresholds are intentionally conservative. Partial success allows the patcher to still function at reduced effectiveness when a few offsets are missing. See the script for the exact counts and thresholds per platform.
 
 ---
 
@@ -369,7 +372,7 @@ When reverse engineering reveals a new patch site:
 
 ### Step 1: Determine if it needs a signature or can be derived
 
-If the new offset is **within ~64KB of an existing anchor** and the relative distance is stable across builds, add a derivation. If it's in a completely different function/region, add a new signature.
+If the new offset is **within ~64KB of an existing anchor** and the relative distance is stable across builds, add a derivation. If it's in a completely different function/region (or is a distinct constant like BWE), add a new signature or a dedicated discovery step (e.g. BWE imm32 scan).
 
 ### Step 2a: Adding a derivation
 
@@ -378,7 +381,7 @@ Edit the `DERIVATIONS` dict:
 ```python
 DERIVATIONS = {
     ...
-    "NewOffsetName": ("AnchorName", 0x1234),  # delta verified across 2+ builds
+    "NewOffsetName": [("AnchorName", 0x1234)],  # delta verified across 2+ builds
 }
 ```
 
@@ -410,13 +413,13 @@ EXPECTED_ORIGINALS["NewOffsetName"] = ("CC", 1)        # expected hex, length
 PATCH_INFO["NewOffsetName"] = ("FF", "Description")    # patch hex, description
 ```
 
-### Step 4: Add to output ordering
+### Step 4: Add to Windows patcher ordering
 
-In `format_powershell_config`, add the name to `ordered_names` in the desired position.
+In `WINDOWS_PATCHER_OFFSET_NAMES`, add the name in the desired position (must match patcher's `offsetOrder`). Update `format_windows_patcher_block` / output ordering if needed.
 
 ### Step 5: Update counts
 
-- Docstring: update offset/signature/derived counts
+- Docstring: update offset/signature counts (e.g. "Windows: 19 offsets")
 - Exit code thresholds: update total offset count and partial threshold if needed
 
 ---
@@ -425,7 +428,7 @@ In `format_powershell_config`, add the name to `ordered_names` in the desired po
 
 When Discord ships a new `discord_voice.node`:
 
-1. **Run the finder against it.** If 18/18 → done, copy the offset table into the patcher.
+1. **Run the finder against it.** If 19/19 Windows patcher offsets → done, copy the Windows patcher block into the patcher's offset region.
 
 2. **If signatures break**, the console tells you which ones. Open the new binary in a disassembler (Ghidra, IDA, Binary Ninja) and:
 
@@ -439,9 +442,11 @@ When Discord ships a new `discord_voice.node`:
    - Update the delta
    - Promote the derived offset to a full signature
 
-4. **If `FILE_OFFSET_ADJUSTMENT` changes**, update the constant. Check the PE section headers: `config_offset = file_offset + (.text virtual_address - .text raw_offset)`.
+4. **If BWE discovery fails**, check that the 518400/921600 immediates still exist in the BuildBitrateTable region and adjust the scan range or logic if the binary layout changed.
 
-5. **Test the patcher** with the new offsets on the new binary before distributing.
+5. **If `FILE_OFFSET_ADJUSTMENT` changes**, update the constant. Check the PE section headers: `config_offset = file_offset + (.text virtual_address - .text raw_offset)`.
+
+6. **Test the patcher** with the new offsets on the new binary before distributing.
 
 ---
 
@@ -453,6 +458,6 @@ When Discord ships a new `discord_voice.node`:
 
 - **No ASLR handling.** The tool works with file offsets / RVAs, not runtime virtual addresses. The patcher handles ASLR via `GetModuleHandle` at runtime.
 
-- **Auto-detection is Windows-only.** Only the automatic search for the binary path is limited to Windows. Given the path to `discord_voice.node`, the finder finds all 18 offsets on Windows, Linux, and macOS.
+- **Auto-detection is Windows-only.** Only the automatic search for the binary path is limited to Windows. Given the path to `discord_voice.node`, the finder can resolve all 19 Windows patcher offsets on the Windows PE binary.
 
 - **Disambiguator fragility.** Some signatures use disambiguator callbacks to choose among multiple pattern matches. Those callbacks rely on nearby instruction patterns; if the compiler restructures the code, a disambiguator can fail even when the signature still matches. Updating the disambiguator or tightening the signature in the script fixes it.
