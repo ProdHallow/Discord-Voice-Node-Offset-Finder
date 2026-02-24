@@ -409,10 +409,9 @@ ELF_SYMBOL_MAP = {
         "linux_scan": "opus_config_channels",
     },
     "SetsBitrateBitrateValue": {
-        # NOT in any named audio function - found via global pattern scan.
-        # Pattern: mov reg1, reg2; movabs rcx, 0x100000000; or rcx, rax
-        # Symbol resolution won't help here; rely on CLANG_ALT_PATTERNS + global scan.
-        "patterns": [],  # Empty = skip symbol resolution, use signature scan only
+        "patterns": ["WebrtcAdmHelper22EnsureRecordingStarted",
+                     "WebrtcAdmHelper20EnsurePlayoutStarted"],
+        "exclude_patterns": ["__function", "__policy"],
         "at_start": False,
         "linux_scan": "bitrate_movabs_or",
     },
@@ -422,8 +421,6 @@ ELF_SYMBOL_MAP = {
         "linux_scan": "opus_config_bitrate",
     },
     "MonoDownmixer": {
-        # In discord::media::CapturedAudioProcessor::Process
-        # test al,al ; je +0x0D ; cmp dword [rbx+off], 9 ; jg
         "patterns": ["CapturedAudioProcessor7Process"],
         "at_start": False,
         "linux_scan": "mono_downmix_test",
@@ -1140,17 +1137,32 @@ def _linux_scan_within_function(data, func_start, func_size, scan_type, adj):
         return None
 
     if scan_type == "stereo_cmp_byte":
-        # CommitAudioCodec: cmp byte [rbx+0x3BB], 0 ; je
-        # Pattern: 80 BB BB 03 00 00 00 74
-        # Target: the comparison value byte (the 00)
+        # CommitAudioCodec: cmp byte [rbx+off], 0 ; jne ; ... ; mov byte [rbx+off], 1
+        # Pattern: 80 BB xx xx xx xx [00|01] [74|75]
+        # Target: the comparison value byte (the 00 on Linux, 01 on Windows)
+        # Disambiguator: the correct cmp is followed within ~48 bytes by
+        #   C6 83 <same 4-byte offset> 01 (mov byte [rbx+same_offset], 1)
         for i in range(flen - 8):
             if (func[i] == 0x80 and func[i+1] == 0xBB
                     and func[i+6] in (0x00, 0x01)
                     and func[i+7] in (0x74, 0x75)):
-                # First hit with short offset < 0x1000 is likely the stereo check
                 member_off = _st.unpack_from('<I', func, i+2)[0]
                 if 0x100 < member_off < 0x1000:
-                    return func_start + i + 6 + adj  # the comparison value byte
+                    # Verify: look for mov byte [rbx+same_offset], 1 within 48 bytes
+                    off_bytes = func[i+2:i+6]  # the 4-byte member offset
+                    setter = b'\xC6\x83' + off_bytes + b'\x01'
+                    search_start = i + 8
+                    search_end = min(i + 56, flen)
+                    if setter in func[search_start:search_end]:
+                        return func_start + i + 6 + adj  # the comparison value byte
+        # Fallback: if no setter-confirmed match, accept first match
+        for i in range(flen - 8):
+            if (func[i] == 0x80 and func[i+1] == 0xBB
+                    and func[i+6] in (0x00, 0x01)
+                    and func[i+7] in (0x74, 0x75)):
+                member_off = _st.unpack_from('<I', func, i+2)[0]
+                if 0x100 < member_off < 0x1000:
+                    return func_start + i + 6 + adj
         return None
 
     if scan_type == "channel_cmov":
@@ -1167,14 +1179,11 @@ def _linux_scan_within_function(data, func_start, func_size, scan_type, adj):
         return None
 
     if scan_type == "bitrate_movabs_or":
-        # movabs rcx, 0x100000000 ; or rcx, rax ; mov [reg+off], rcx
-        # 48 B9 00 00 00 00 01 00 00 00 48 09 C1
         for i in range(flen - 16):
             if (func[i:i+2] == b'\x48\xb9'
                     and func[i+6:i+10] == b'\x01\x00\x00\x00'
                     and func[i+10:i+13] == b'\x48\x09\xc1'):
-                return func_start + i + 2 + adj  # the immediate bytes
-        # Also search full .text if function didn't contain it
+                return func_start + i + 2 + adj
         return None
 
     if scan_type == "mono_downmix_test":
@@ -1515,7 +1524,12 @@ def _resolve_elf_symbols(bin_info, data):
         if not candidates:
             continue
 
-        # Prefer smallest function (most specific overload) if requested
+        if mapping.get('exclude_patterns'):
+            candidates = [c for c in candidates
+                          if not any(ep in c['name'] for ep in mapping['exclude_patterns'])]
+            if not candidates:
+                continue
+
         if mapping.get('prefer_smallest'):
             candidates.sort(key=lambda c: c.get('size', 0x10000))
         # Prefer largest function (real impl over lambda wrappers) if requested
@@ -2622,7 +2636,7 @@ EXPECTED_ORIGINALS_CLANG = {
 
 EXPECTED_ORIGINALS_LINUX_ONLY = {
     "EmulateStereoSuccess1":    ("00", 1),
-    "EmulateStereoSuccess2":    ("74", 1),
+    "EmulateStereoSuccess2":    ("75", 1),
     "CreateAudioFrameStereo":   ("4C 0F 43", 4),
 }
 
