@@ -1780,6 +1780,7 @@ WINDOWS_PATCHER_OFFSET_NAMES = [
     "ThrowError",
     "EncoderConfigInit1",
     "EncoderConfigInit2",
+    "DuplicateEmulateBitrateModified",
     "BWE_Thr2",
     "BWE_Thr3",
 ]
@@ -2621,9 +2622,11 @@ EXPECTED_ORIGINALS = {
     "DownmixFunc":              ("41", 1),
     "HighpassCutoffFilter":     (None, 0x100),
     "DcReject":                 (None, 0x1B6),
-    "DuplicateEmulateBitrateModified": (None, 3),
+    "DuplicateEmulateBitrateModified": ("00 7D 00 00", 4),
     "EncoderConfigInit1":       ("00 7D 00 00", 4),
     "EncoderConfigInit2":       ("00 7D 00 00", 4),
+    "BWE_Thr2":                 (None, 7),
+    "BWE_Thr3":                 (None, 7),
 }
 
 EXPECTED_ORIGINALS_CLANG = {
@@ -2688,9 +2691,11 @@ PATCH_INFO = {
     "DownmixFunc":              ("C3", "ret (disable downmix)"),
     "HighpassCutoffFilter":     ("<injected: hp_cutoff>", "Custom HP cutoff + gain"),
     "DcReject":                 ("<injected: dc_reject>", "Custom DC reject + gain"),
-    "DuplicateEmulateBitrateModified": (BITRATE_PATCH_3, "Dup imul 32000->384000"),
+    "DuplicateEmulateBitrateModified": (BITRATE_PATCH_4, "Dup bitrate 32000->384000"),
     "EncoderConfigInit1":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
     "EncoderConfigInit2":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
+    "BWE_Thr2":                 (BITRATE_PATCH_4, "BWE threshold: 518400->384000"),
+    "BWE_Thr3":                 (BITRATE_PATCH_4, "BWE threshold: 921600->384000"),
 }
 
 
@@ -2949,6 +2954,7 @@ PATCHER_DEBUG_GROUPS = {
     "ENCODER": [
         ("EncoderConfigInit1", "EncoderConfigInit1 (32000->384000)"),
         ("EncoderConfigInit2", "EncoderConfigInit2 (32000->384000)"),
+        ("DuplicateEmulateBitrateModified", "DuplicateEmulateBitrateModified (32000->384000)"),
     ],
     "BWE_384": [
         ("BWE_Thr2", "BWE_Thr2 (518400->384000)"),
