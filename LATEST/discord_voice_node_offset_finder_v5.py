@@ -2,18 +2,17 @@
 """
 Discord Voice Node Offset Finder v5.1
 Cross-platform offset discovery for discord_voice.node (PE/ELF/Mach-O).
-Windows: 19 offsets for Discord_voice_node_patcher.ps1. Linux/macOS: 18.
+Windows/Linux/macOS: 17 offsets (same set for all patchers).
 Includes confidence scoring, heuristic analysis, and patch site validation.
 Usage: python discord_voice_node_offset_finder_v5.py [path_to_discord_voice.node]
 """
 
 import sys
 import os
+import atexit
 import struct
 import json
 import hashlib
-import platform
-import glob as _glob
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -3357,11 +3356,16 @@ def check_injection_sites(data, results, adj):
 
 
 # region Output Formatters
+# Output blocks are copy-paste compatible with:
+# - Windows: Discord_voice_node_patcher.ps1 (# region Offsets ... # endregion; order = $Script:RequiredOffsetNames)
+# - Linux:   discord_voice_patcher_linux.sh (EXPECTED_MD5, EXPECTED_SIZE, OFFSET_*=0xHEX, FILE_OFFSET_ADJUSTMENT=0)
+# - macOS:   declare -A OFFSETS=( [Name]=0xHEX ... ); FILE_OFFSET_ADJUSTMENT=0 (fat file offset for x86_64 slice)
 
 def format_powershell_config(results, bin_info=None, file_path=None, file_size=None):
     """Generate PowerShell offset table - copy-paste directly into patcher."""
     lines = []
-    fmt = bin_info.get('format', 'raw') if bin_info else 'pe'
+    fmt = (bin_info or {}).get('format', 'raw')
+    adj = (bin_info or {}).get('file_offset_adjustment', 0)
 
     if bin_info and file_path and file_size:
         md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest()
@@ -3379,7 +3383,6 @@ def format_powershell_config(results, bin_info=None, file_path=None, file_size=N
     lines.append("    Offsets = @{")
     ordered = _all_offset_names()
     max_len = max(len(n) for n in ordered)
-    adj = bin_info.get('file_offset_adjustment', 0) if bin_info else 0
 
     for name in ordered:
         pad = " " * (max_len - len(name))
@@ -3446,13 +3449,13 @@ _MONTHS_ASCII = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def format_windows_patcher_block(results, bin_info, file_path, file_size, optional_encoder_config_init3=None):
+def format_windows_patcher_block(results, bin_info, file_path, file_size):
+    """Generate Windows patcher block. Order must match $Script:RequiredOffsetNames in the patcher."""
     if not bin_info or not file_path or file_size is None:
         return None
-    fmt = bin_info.get('format', 'raw')
-    if fmt != 'pe':
+    if bin_info.get('format') != 'pe':
         return None
-    ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
+    ok, _err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
     if not ok:
         return None
     with open(file_path, 'rb') as f:
@@ -3474,14 +3477,14 @@ def format_windows_patcher_block(results, bin_info, file_path, file_size, option
         "",
         "$Script:Offsets = @{",
     ]
+    # Same order as $Script:RequiredOffsetNames in Discord_voice_node_patcher.ps1
     ordered = WINDOWS_PATCHER_OFFSET_ORDER
     max_len = max((len(n) for n in ordered), default=0)
     for name in ordered:
         if name not in results:
             continue
         pad = " " * (max_len - len(name))
-        val = "0x%X" % results[name]
-        lines.append("    %s%s = %s" % (name, pad, val))
+        lines.append("    %s%s = 0x%X" % (name, pad, results[name]))
     lines.append("}")
     lines.append("")
     lines.append("# endregion Offsets")
@@ -3591,15 +3594,6 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size):
     return "\n".join(lines)
 
 
-def format_cpp_namespace(results):
-    """Generate C++ namespace block for reference."""
-    lines = ["namespace Offsets {"]
-    for name in sorted(results.keys()):
-        lines.append(f"    constexpr uint32_t {name} = 0x{results[name]:X};")
-    lines.append("};")
-    return "\n".join(lines)
-
-
 def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
     """Generate machine-readable JSON output."""
     fmt = bin_info.get('format', 'raw') if bin_info else 'pe'
@@ -3615,7 +3609,7 @@ def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
         "offsets": {name: hex(off) for name, off in sorted(results.items())},
         "resolution_tiers": tiers_used,
         "total_found": len(results),
-        "total_expected": 18,
+        "total_expected": len(ALL_OFFSET_NAMES),
     }
 
     if fmt == 'pe' and bin_info:
@@ -3629,7 +3623,7 @@ def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
         out["file_offsets"] = {name: hex(off - adj) for name, off in sorted(results.items())}
 
     # macOS stereo mic patches (when applicable)
-    if fmt == 'macho' and 'stereo_patches' in bin_info:
+    if bin_info and fmt == 'macho' and 'stereo_patches' in bin_info:
         out["stereo_patches"] = bin_info["stereo_patches"]
 
     return json.dumps(out, indent=2, ensure_ascii=True)
@@ -3844,7 +3838,22 @@ def find_discord_node():
 
 # region Main
 
+def _cleanup_created_files(path_list):
+    """Remove all files the script created (called at exit)."""
+    for p in path_list:
+        try:
+            Path(p).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
 def main():
+    # Track files we create so we can remove them on exit
+    created_files = []
+    atexit.register(_cleanup_created_files, created_files)
+
     print("=" * 65)
     print(f"  Discord Voice Node Offset Finder v{VERSION}")
     print("  Cross-platform tiered scanning with chain-aware derivation")
@@ -3944,7 +3953,6 @@ def main():
     verified, warnings = validate_offsets(data, results, adj, bin_fmt=fmt)
     check_injection_sites(data, results, adj)
 
-    encoder_config_init3_rva = None
     if fmt == 'pe':
         ts = bin_info.get('text_section')
         if ts:
@@ -3953,7 +3961,7 @@ def main():
         else:
             t_start = 0
             t_end = len(data)
-        encoder_config_init3_rva = run_bitrate_audit_pe(data, results, adj, t_start, t_end)
+        run_bitrate_audit_pe(data, results, adj, t_start, t_end)
 
     # --- Cross-validation ------------------------------------------
     xval_warnings = _cross_validate(results, adj, data, tiers_used=tiers_used)
@@ -3988,6 +3996,7 @@ def main():
     if len(results) >= 10:
         viz_path = generate_viz_graph(results, file_path.parent)
         if viz_path:
+            created_files.append(viz_path)
             print(f"\n  Dependency graph saved: {viz_path}")
 
     # --- Summary ---------------------------------------------------
@@ -4000,14 +4009,14 @@ def main():
         print(f"  Windows patcher:   {patcher_count} / {len(PATCHER_OFFSET_NAMES)}  (required for Discord_voice_node_patcher.ps1)")
         print(f"  x86_64 discovered: {len(results)} offsets")
     else:
-        print(f"  x86_64 found:      {len(results)} / 18")
+        print(f"  x86_64 found:      {len(results)} / {len(ALL_OFFSET_NAMES)}")
     print(f"  Bytes verified:   {verified}")
     print(f"  Warnings:         {warnings}")
     print(f"  Cross-validation: {len(xval_warnings)} issue(s)" if xval_warnings else "  Cross-validation: clean")
     print(f"  Errors:           {len(errors)}")
 
     if arm64_info:
-        print(f"  arm64 found:      {len(arm64_results)} / 18")
+        print(f"  arm64 found:      {len(arm64_results)} / {len(ALL_OFFSET_NAMES)}")
 
     # Show resolution tier breakdown
     tier_counts = {}
@@ -4043,7 +4052,7 @@ def main():
     if results:
         # For Windows (PE), print the exact patcher block first so users copy the right thing
         if fmt == 'pe':
-            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size, optional_encoder_config_init3=encoder_config_init3_rva)
+            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
             if not win_block and bin_info and file_size is not None:
                 ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
                 if not ok:
@@ -4097,10 +4106,12 @@ def main():
 
         # Non-PE: also show file offsets block
         if fmt != 'pe':
+            offset_names = _all_offset_names()
+            max_name_len = max(len(n) for n in offset_names)
             print("\n    # File offsets for direct binary patching (hex editor):")
             print("    FileOffsets = @{")
-            for name in _all_offset_names():
-                pad = " " * (max(len(n) for n in _all_offset_names()) - len(name))
+            for name in offset_names:
+                pad = " " * (max_name_len - len(name))
                 if name in results:
                     file_off = results[name] - adj
                     print(f"        {name}{pad} = 0x{file_off:X}")
@@ -4186,6 +4197,7 @@ def main():
             try:
                 out_path = try_dir / "offsets.txt"
                 out_path.write_text("\n".join(file_content), encoding="ascii")
+                created_files.append(out_path)
                 print(f"\n  Offset file saved: {out_path}")
                 break
             except Exception:
@@ -4216,6 +4228,7 @@ def main():
                 except Exception:
                     pass
             json_path.write_text(json_text, encoding="ascii")
+            created_files.append(json_path)
             print(f"  JSON saved: {json_path}")
         except Exception:
             pass
@@ -4236,17 +4249,23 @@ def main():
             return 1
         print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_patcher} ***")
         return 2
-    if total_x86 == 18:
-        msg = "*** ALL 18 x86_64 OFFSETS FOUND SUCCESSFULLY ***"
+    n_required = len(ALL_OFFSET_NAMES)
+    arm64_ok = (total_arm64 < 0) or (total_arm64 == n_required)
+    if total_x86 == n_required and arm64_ok:
+        msg = f"*** ALL {n_required} x86_64 OFFSETS FOUND SUCCESSFULLY ***"
         if total_arm64 >= 0:
-            msg += f"  |  arm64: {total_arm64}/18"
+            msg += f"  |  arm64: {total_arm64}/{n_required}"
         print(f"\n  {msg}")
         return 0
-    elif total_x86 >= 15:
-        print(f"\n  *** PARTIAL SUCCESS: {total_x86}/18 x86_64 offsets found ***")
+    elif total_x86 >= n_required - 2:
+        print(f"\n  *** PARTIAL SUCCESS: {total_x86}/{n_required} x86_64 offsets found ***", end="")
+        if total_arm64 >= 0 and total_arm64 < n_required:
+            print(f"  (arm64: {total_arm64}/{n_required})")
+        else:
+            print()
         return 1
     else:
-        print(f"\n  *** INSUFFICIENT RESULTS: {total_x86}/18 x86_64 offsets found ***")
+        print(f"\n  *** INSUFFICIENT RESULTS: {total_x86}/{n_required} x86_64 offsets found ***")
         return 2
 
 
