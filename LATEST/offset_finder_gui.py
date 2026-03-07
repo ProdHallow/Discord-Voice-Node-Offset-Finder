@@ -9,6 +9,8 @@ Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher
 
 import os
 import sys
+import shutil
+import atexit
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
@@ -17,9 +19,19 @@ from pathlib import Path
 import importlib.util
 import io
 
+sys.dont_write_bytecode = True
+
 VERSION = "1.0.0"
 SCRIPT_DIR = Path(__file__).parent
 TARGET_BITRATE_KBPS = 384
+
+
+def _cleanup_pycache():
+    for d in SCRIPT_DIR.glob("__pycache__"):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+atexit.register(_cleanup_pycache)
 
 BG           = "#1e1e1e"
 BG_LIGHT     = "#2d2d2d"
@@ -48,8 +60,8 @@ class OffsetFinderGUI:
         self.root.title("Offset Finder")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
-        self.root.minsize(620, 580)
-        self.root.geometry("660x700")
+        self.root.minsize(620, 640)
+        self.root.geometry("660x750")
 
         try:
             self.root.iconbitmap(default="")
@@ -63,6 +75,8 @@ class OffsetFinderGUI:
         self.status_var = tk.StringVar(value="Ready")
         self.last_output = ""
         self.last_windows_block = ""
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
         self._load_finder()
@@ -147,6 +161,16 @@ class OffsetFinderGUI:
                                 bd=0, anchor="w")
             cb.pack(anchor="w", pady=1)
 
+        btn_frame = tk.Frame(self.root, bg=BG)
+        btn_frame.pack(side="bottom", fill="x", padx=16, pady=(8, 14))
+
+        status_frame = tk.Frame(self.root, bg=BG_LIGHT, height=24)
+        status_frame.pack(side="bottom", fill="x", padx=16, pady=(6, 0))
+        self.status_label = tk.Label(status_frame, textvariable=self.status_var,
+                                     font=("Segoe UI", 8), bg=BG_LIGHT, fg=FG_DIM,
+                                     anchor="w")
+        self.status_label.pack(fill="x", padx=6, pady=2)
+
         output_frame = tk.Frame(self.root, bg=BG)
         output_frame.pack(fill="both", expand=True, padx=16, pady=(10, 0))
 
@@ -162,16 +186,6 @@ class OffsetFinderGUI:
         self.output.tag_config("info", foreground=CYAN)
         self.output.tag_config("header", foreground=ORANGE, font=("Consolas", 9, "bold"))
         self.output.tag_config("success", foreground=GREEN, font=("Consolas", 10, "bold"))
-
-        status_frame = tk.Frame(self.root, bg=BG_LIGHT, height=24)
-        status_frame.pack(fill="x", padx=16, pady=(6, 0))
-        self.status_label = tk.Label(status_frame, textvariable=self.status_var,
-                                     font=("Segoe UI", 8), bg=BG_LIGHT, fg=FG_DIM,
-                                     anchor="w")
-        self.status_label.pack(fill="x", padx=6, pady=2)
-
-        btn_frame = tk.Frame(self.root, bg=BG)
-        btn_frame.pack(fill="x", padx=16, pady=(8, 14))
 
         self.run_btn = self._make_button(btn_frame, "Find Offsets", GREEN, GREEN_HOVER,
                                          self._run_finder)
@@ -221,6 +235,7 @@ class OffsetFinderGUI:
         if path:
             self.file_path.set(path)
             self._auto_detect_os(path)
+            self._run_finder()
 
     def _auto_detect_os(self, path):
         try:
@@ -243,6 +258,7 @@ class OffsetFinderGUI:
         path = event.data.strip("{}")
         self.file_path.set(path)
         self._auto_detect_os(path)
+        self._run_finder()
 
     def _clear_output(self):
         self.output.configure(state="normal")
@@ -364,7 +380,7 @@ class OffsetFinderGUI:
                     f"  arm64 slice: {a64.get('fat_size', 0):,} bytes | "
                     f"{n_a64} symbols\n", "info")
 
-            self._append_output_safe(f"\n  Scanning for offsets...\n\n", "header")
+            self._append_output_safe("\n  Scanning for offsets...\n\n", "header")
 
             old_stdout = sys.stdout
             capture = io.StringIO()
@@ -398,7 +414,7 @@ class OffsetFinderGUI:
             n_patcher = len(patcher_names) if patcher_names else 17
 
             self._append_output_safe(f"\n  {'=' * 55}\n", "header")
-            self._append_output_safe(f"  RESULTS SUMMARY\n", "header")
+            self._append_output_safe("  RESULTS SUMMARY\n", "header")
             self._append_output_safe(f"  {'=' * 55}\n", "header")
             if is_pe and patcher_names:
                 self._append_output_safe(
@@ -431,7 +447,7 @@ class OffsetFinderGUI:
                     for w in xval:
                         self._append_output_safe(f"  [XVAL] {w}\n", "warn")
                 else:
-                    self._append_output_safe(f"  Cross-validation: clean\n", "pass")
+                    self._append_output_safe("  Cross-validation: clean\n", "pass")
             except Exception:
                 pass
 
@@ -504,22 +520,24 @@ class OffsetFinderGUI:
                         self._append_output_safe(mod.format_windows_debug_mode(results) + "\n\n", None)
 
             if fmt != "pe":
-                self._append_output_safe(f"\n", None)
+                self._append_output_safe("\n", None)
+                ps_text = None
+                old_stdout = sys.stdout
                 try:
-                    old_stdout = sys.stdout
                     ps_capture = io.StringIO()
                     sys.stdout = ps_capture
                     ps_text = mod.format_powershell_config(
                         results, bin_info=bin_info, file_path=path,
                         file_size=len(data))
-                    sys.stdout = old_stdout
-                    if ps_text:
-                        self._append_output_safe("  " + "=" * 55 + "\n", "header")
-                        self._append_output_safe("  PATCHER OFFSET TABLE\n", "header")
-                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
-                        self._append_output_safe(ps_text + "\n", None)
                 except Exception:
+                    pass
+                finally:
                     sys.stdout = old_stdout
+                if ps_text:
+                    self._append_output_safe("  " + "=" * 55 + "\n", "header")
+                    self._append_output_safe("  PATCHER OFFSET TABLE\n", "header")
+                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    self._append_output_safe(ps_text + "\n", None)
 
             if fmt == "elf" and hasattr(mod, "format_linux_patcher_block"):
                 block = mod.format_linux_patcher_block(results, bin_info, path, file_size)
@@ -589,9 +607,20 @@ class OffsetFinderGUI:
     def _set_status_safe(self, text):
         self.root.after(0, lambda: self.status_var.set(text))
 
+    def _on_close(self):
+        _cleanup_pycache()
+        self.root.destroy()
+
 
 def main():
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
     root = tk.Tk()
+
     try:
         from ctypes import windll, c_int, byref
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -602,6 +631,12 @@ def main():
             byref(c_int(1)), 4)
     except Exception:
         pass
+
+    root.option_add("*TCombobox*Listbox.background", BG_INPUT)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", SELECT_BG)
+    root.option_add("*TCombobox*Listbox.selectForeground", FG_ACCENT)
+
     style = ttk.Style()
     style.theme_use("clam")
     style.configure("TCombobox",

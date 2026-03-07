@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Discord Voice Node Offset Finder v5.0
+Discord Voice Node Offset Finder v5.1
 Cross-platform offset discovery for discord_voice.node (PE/ELF/Mach-O).
 Windows: 19 offsets for Discord_voice_node_patcher.ps1. Linux/macOS: 18.
+Includes confidence scoring, heuristic analysis, and patch site validation.
 Usage: python discord_voice_node_offset_finder_v5.py [path_to_discord_voice.node]
 """
 
@@ -25,7 +26,7 @@ try:
 except ImportError:
     VIZ_AVAILABLE = False
 
-VERSION = "5.0"
+VERSION = "5.1"
 
 TARGET_BITRATE_BPS = 384000
 _BITRATE_LE = TARGET_BITRATE_BPS.to_bytes(4, "little")
@@ -61,10 +62,6 @@ DERIVATIONS = {
     ],
     "EncoderConfigInit1": [
         ("AudioEncoderOpusConfigSetChannels", 0xA),
-    ],
-    "DuplicateEmulateBitrateModified": [
-        ("EmulateBitrateModified", 0x4EE6),
-        ("EmulateStereoSuccess1", 0x45F + 0x4EE6),
     ],
 }
 
@@ -388,7 +385,9 @@ ELF_SYMBOL_MAP = {
         # discord::media::LocalUser::CommitAudioCodec (NOT lambda invokers)
         # Contains stereo emulation check: cmp byte [rbx+0x3BB], 0 ; je
         # Target: the comparison value byte (0x00 on Linux, 0x01 on Windows)
-        "patterns": ["LocalUser16CommitAudioCodecEv"],
+        # On macOS x86_64, Clang may put this check in ApplySettings instead.
+        "patterns": ["LocalUser16CommitAudioCodecEv",
+                     "LocalUser13ApplySettings"],
         "at_start": False,
         "linux_scan": "stereo_cmp_byte",
         "prefer_largest": True,  # Lambda wrappers are ~31 bytes; real function is ~2020
@@ -424,6 +423,20 @@ ELF_SYMBOL_MAP = {
         "patterns": ["CapturedAudioProcessor7Process"],
         "at_start": False,
         "linux_scan": "mono_downmix_test",
+    },
+    "EmulateStereoSuccess2": {
+        "patterns": ["LocalUser16CommitAudioCodecEv",
+                     "LocalUser13ApplySettings"],
+        "at_start": False,
+        "linux_scan": "stereo_success2_byte",
+        "prefer_largest": True,
+    },
+    "Emulate48Khz": {
+        "patterns": ["LocalUser16CommitAudioCodecEv",
+                     "LocalUser13ApplySettings"],
+        "at_start": False,
+        "linux_scan": "emulate_48khz_cmov",
+        "prefer_largest": True,
     },
 }
 
@@ -534,13 +547,6 @@ ARM64_SYMBOL_MAP = {
                      "SetupMediaChannel"],
         "at_start": False,
         "arm64_scan": "arm64_bitrate_or_insn",
-    },
-    "DuplicateEmulateBitrateModified": {
-        "patterns": ["LocalUser21CreateVideoSendStream",
-                     "LocalUser16CommitAudioCodecEv"],
-        "at_start": False,
-        "arm64_scan": "arm64_dup_bitrate_modified",
-        "prefer_largest": True,
     },
 }
 
@@ -1009,6 +1015,12 @@ def _find_stereo_x86(slice_info, out):
         orig = _parse_hex_bytes(s["o"])
         if d[po : po + len(orig)] != orig:
             continue
+        ok, conf, val_msgs = _run_patch_site_validation(d, po, s, 0)
+        if not ok:
+            for vmsg in val_msgs:
+                print(f"[warn] {vmsg}")
+            print(f"[warn] {s['n']}: validation failed (confidence {conf}), skipping stereo patch")
+            continue
         key = (s["n"], 0)
         if key in seen:
             continue
@@ -1029,6 +1041,12 @@ def _find_stereo_arm64(slice_info, out):
         po = m + s["t"]
         orig = _parse_hex_bytes(s["o"])
         if d[po : po + len(orig)] != orig:
+            continue
+        ok, conf, val_msgs = _run_patch_site_validation(d, po, s, 0)
+        if not ok:
+            for vmsg in val_msgs:
+                print(f"[warn] {vmsg}")
+            print(f"[warn] {s['n']}: validation failed (confidence {conf}), skipping stereo patch")
             continue
         key = (s["n"], occ)
         if key in seen:
@@ -1137,32 +1155,143 @@ def _linux_scan_within_function(data, func_start, func_size, scan_type, adj):
         return None
 
     if scan_type == "stereo_cmp_byte":
-        # CommitAudioCodec: cmp byte [rbx+off], 0 ; jne ; ... ; mov byte [rbx+off], 1
-        # Pattern: 80 BB xx xx xx xx [00|01] [74|75]
-        # Target: the comparison value byte (the 00 on Linux, 01 on Windows)
-        # Disambiguator: the correct cmp is followed within ~48 bytes by
-        #   C6 83 <same 4-byte offset> 01 (mov byte [rbx+same_offset], 1)
+        # CommitAudioCodec: cmp byte [reg+off], val ; jcc
+        # MSVC/Linux pattern:  80 BB xx xx xx xx [00|01] [74|75] (rbx, short jcc)
+        # Clang/macOS pattern: 80 B9 xx xx xx xx [01] 0F [84|85] (rcx, near jcc)
+        # Target: the comparison value byte (the 00 on Linux, 01 on Windows/macOS)
+        # Disambiguator: setter "C6 [80+reg] <same offset> 01" within 56 bytes
+        # Accept any base register: ModRM 0xB8-0xBF (cmp byte [reg+disp32], imm8)
+        # Accept short jcc (74/75) or near jcc (0F 84/0F 85)
+        def _is_stereo_cmp(buf, pos, buflen):
+            """Check if pos is a cmp byte [reg+disp32], val; jcc pattern."""
+            if pos + 8 > buflen:
+                return False, 0, 0
+            if buf[pos] != 0x80:
+                return False, 0, 0
+            modrm = buf[pos + 1]
+            if not (0xB8 <= modrm <= 0xBF):
+                return False, 0, 0
+            # Skip SIB-based addressing (modrm & 7 == 4)
+            if (modrm & 7) == 4:
+                return False, 0, 0
+            val = buf[pos + 6]
+            if val not in (0x00, 0x01):
+                return False, 0, 0
+            jcc_byte = buf[pos + 7]
+            if jcc_byte not in (0x74, 0x75, 0x0F):
+                return False, 0, 0
+            # For near jcc, verify the second byte is 84 or 85
+            if jcc_byte == 0x0F and pos + 9 <= buflen:
+                if buf[pos + 8] not in (0x84, 0x85):
+                    return False, 0, 0
+            member_off = _st.unpack_from('<I', buf, pos + 2)[0]
+            if not (0x100 < member_off < 0x1000):
+                return False, 0, 0
+            return True, modrm, member_off
+
+        # Pass 1: setter-confirmed match (most reliable)
         for i in range(flen - 8):
-            if (func[i] == 0x80 and func[i+1] == 0xBB
-                    and func[i+6] in (0x00, 0x01)
-                    and func[i+7] in (0x74, 0x75)):
-                member_off = _st.unpack_from('<I', func, i+2)[0]
-                if 0x100 < member_off < 0x1000:
-                    # Verify: look for mov byte [rbx+same_offset], 1 within 48 bytes
-                    off_bytes = func[i+2:i+6]  # the 4-byte member offset
-                    setter = b'\xC6\x83' + off_bytes + b'\x01'
-                    search_start = i + 8
-                    search_end = min(i + 56, flen)
-                    if setter in func[search_start:search_end]:
-                        return func_start + i + 6 + adj  # the comparison value byte
-        # Fallback: if no setter-confirmed match, accept first match
+            ok, modrm, member_off = _is_stereo_cmp(func, i, flen)
+            if not ok:
+                continue
+            off_bytes = func[i+2:i+6]
+            # Build setter: C6 [80+reg] <same offset> 01
+            setter_modrm = 0x80 | (modrm & 7)
+            setter = bytes([0xC6, setter_modrm]) + off_bytes + b'\x01'
+            search_start = i + 8
+            search_end = min(i + 56, flen)
+            if setter in func[search_start:search_end]:
+                return func_start + i + 6 + adj
+        # Pass 2: accept first match without setter confirmation
         for i in range(flen - 8):
-            if (func[i] == 0x80 and func[i+1] == 0xBB
-                    and func[i+6] in (0x00, 0x01)
-                    and func[i+7] in (0x74, 0x75)):
-                member_off = _st.unpack_from('<I', func, i+2)[0]
-                if 0x100 < member_off < 0x1000:
-                    return func_start + i + 6 + adj
+            ok, modrm, member_off = _is_stereo_cmp(func, i, flen)
+            if ok:
+                return func_start + i + 6 + adj
+        return None
+
+    if scan_type == "stereo_success2_byte":
+        # Second stereo patch site in CommitAudioCodec.
+        # Find the second cmp byte [reg+disp32], val; jcc pair.
+        # Target: the jcc byte (short: 74/75, or near: the 0F byte).
+        # On Windows: expected "75" (jne short). On macOS: "0F" (near jcc).
+        found_first = False
+        for i in range(flen - 8):
+            if func[i] != 0x80:
+                continue
+            modrm = func[i + 1]
+            if not (0xB8 <= modrm <= 0xBF) or (modrm & 7) == 4:
+                continue
+            val = func[i + 6]
+            jcc_byte = func[i + 7]
+            if val not in (0x00, 0x01):
+                continue
+            if jcc_byte not in (0x74, 0x75, 0x0F):
+                continue
+            if jcc_byte == 0x0F and i + 9 <= flen:
+                if func[i + 8] not in (0x84, 0x85):
+                    continue
+            member_off = _st.unpack_from('<I', func, i + 2)[0]
+            if not (0x100 < member_off < 0x1000):
+                continue
+            if not found_first:
+                found_first = True
+                continue
+            # Second match: target is the jcc byte
+            return func_start + i + 7 + adj
+        return None
+
+    if scan_type == "emulate_48khz_cmov":
+        # CommitAudioCodec: conditional selection of sample rate config.
+        # On MSVC: cmovb after comparing channel count.
+        # On Clang/macOS: CMOV (0F 42-4F) or REX+CMOV (48 0F 43) after a
+        #   cmp dword [reg+off], 2  (channel count comparison).
+        # Target: the CMOV instruction.
+        # Search for cmp dword [reg+off], 2; ... cmov within 20 bytes.
+        for i in range(flen - 16):
+            # cmp dword [rbx+disp32], 2: 83 BB xx xx xx xx 02
+            if func[i] == 0x83 and 0xB8 <= func[i+1] <= 0xBF:
+                if (func[i+1] & 7) == 4:
+                    continue
+                disp = _st.unpack_from('<I', func, i+2)[0]
+                if 0x40 < disp < 0x1000 and func[i+6] == 0x02:
+                    # Found channel count cmp; search forward for CMOV
+                    for j in range(7, 20):
+                        if i + j + 4 > flen:
+                            break
+                        b0 = func[i + j]
+                        b1 = func[i + j + 1]
+                        # Plain CMOV: 0F 4x
+                        if b0 == 0x0F and 0x40 <= b1 <= 0x4F:
+                            return func_start + i + j + adj
+                        # REX.W + CMOV: 48 0F 4x
+                        if b0 == 0x48 and b1 == 0x0F and i + j + 2 < flen:
+                            if 0x40 <= func[i + j + 2] <= 0x4F:
+                                return func_start + i + j + adj
+            # 41 83 variant (REX.B for r8-r15 base)
+            if func[i] == 0x41 and func[i+1] == 0x83 and i+8 <= flen:
+                if 0xB8 <= func[i+2] <= 0xBF and (func[i+2] & 7) != 4:
+                    disp = _st.unpack_from('<I', func, i+3)[0]
+                    if 0x40 < disp < 0x1000 and func[i+7] == 0x02:
+                        for j in range(8, 24):
+                            if i + j + 4 > flen:
+                                break
+                            b0 = func[i + j]
+                            b1 = func[i + j + 1]
+                            if b0 == 0x0F and 0x40 <= b1 <= 0x4F:
+                                return func_start + i + j + adj
+                            if b0 == 0x48 and b1 == 0x0F and i + j + 2 < flen:
+                                if 0x40 <= func[i + j + 2] <= 0x4F:
+                                    return func_start + i + j + adj
+        # Fallback: look for any CMOV near a LEA pair (Clang pattern)
+        for i in range(flen - 12):
+            if func[i:i+3] == b'\x48\x8d\x05' or func[i:i+3] == b'\x48\x8d\x15':
+                # LEA rax/rdx, [rip+disp32] - check for second LEA then CMOV
+                for j in range(7, 24):
+                    if i + j + 4 > flen:
+                        break
+                    if func[i+j] == 0x48 and func[i+j+1] == 0x0F:
+                        if 0x40 <= func[i+j+2] <= 0x4F:
+                            return func_start + i + j + adj
         return None
 
     if scan_type == "channel_cmov":
@@ -1552,35 +1681,49 @@ def _resolve_elf_symbols(bin_info, data):
                 resolved[offset_name] = sym_addr
                 details.append((offset_name, sym_addr, best['name'], 'symbol-direct'))
         else:
-            # Instruction-level - scan within the function for exact target
-            func_size = best.get('size', 0)
-            if func_size == 0 or func_size > 0x10000:
-                func_size = 0x2000
-
-            func_file_start = sym_addr - adj
-            if func_file_start < 0:
-                func_file_start = 0
-
+            # Instruction-level - scan within the function for exact target.
+            # Try each candidate function in priority order until scan succeeds.
             linux_scan = mapping.get('linux_scan')
-            if linux_scan:
-                result = _linux_scan_within_function(
-                    data, func_file_start, func_size, linux_scan, adj)
-                if result is not None:
-                    resolved[offset_name] = result
-                    details.append((offset_name, result, best['name'], 'symbol+scan'))
-                else:
-                    # Store hint for fallback scanning
+            scan_found = False
+            for candidate in candidates:
+                func_size = candidate.get('size', 0)
+                if func_size == 0 or func_size > 0x10000:
+                    func_size = 0x2000
+
+                func_file_start = candidate['value'] - adj
+                if func_file_start < 0:
+                    func_file_start = 0
+
+                if linux_scan:
+                    result = _linux_scan_within_function(
+                        data, func_file_start, func_size, linux_scan, adj)
+                    if result is not None:
+                        resolved[offset_name] = result
+                        details.append((offset_name, result, candidate['name'], 'symbol+scan'))
+                        scan_found = True
+                        break
+
+            if not scan_found:
+                # Store hint from best candidate for fallback scanning
+                func_size = best.get('size', 0)
+                if func_size == 0 or func_size > 0x10000:
+                    func_size = 0x2000
+                func_file_start = sym_addr - adj
+                if func_file_start < 0:
+                    func_file_start = 0
+
+                if linux_scan:
                     func_file_end = min(func_file_start + func_size, len(data))
                     resolved[f"_symhint_{offset_name}"] = (
                         func_file_start, func_file_end, best['name'])
                     details.append((offset_name, sym_addr, best['name'],
                                     'symbol-range-hint'))
-            else:
-                func_file_end = min(func_file_start + func_size, len(data))
-                resolved[f"_symhint_{offset_name}"] = (
-                    func_file_start, func_file_end, best['name'])
-                details.append((offset_name, sym_addr, best['name'],
-                                'symbol-range-hint'))
+                else:
+                    func_file_end = min(func_file_start + func_size, len(data))
+                    resolved[f"_symhint_{offset_name}"] = (
+                        func_file_start, func_file_end, best['name'])
+                    details.append((offset_name, sym_addr, best['name'],
+                                    'symbol-range-hint'))
 
     return resolved, details
 
@@ -1709,7 +1852,506 @@ def find_offset(data, sig, text_start=0, text_end=None):
 
     return None, f"no matches across {len(tiers)} tier(s)", "none"
 
-# endregion Signature Scanner
+
+# region Patch Safety and Heuristics
+
+CONFIDENCE_THRESHOLD = 75
+CONFIDENCE_SIGNATURE_MATCH = 50
+CONFIDENCE_CONTEXT_VALID = 25
+CONFIDENCE_ORIGINAL_BYTES = 25
+CONFIDENCE_FINGERPRINT_MATCH = 20
+CONFIDENCE_HEURISTIC_PATTERN = 15
+
+# Opcode prefixes and common instruction starts (x86-64)
+_OPCODE_PREFIXES = (0x66, 0xF2, 0xF3, 0x2E, 0x3E, 0x26, 0x64, 0x65, 0x36)
+_COMMON_OPCODES = (0x48, 0x49, 0x4C, 0x4D, 0x55, 0x53, 0x56, 0x57, 0x41, 0xC3,
+                   0x89, 0x8B, 0xB8, 0xB9, 0xC7, 0xE8, 0xE9, 0x74, 0x75, 0x0F)
+
+
+def validate_context(binary_data, offset, expected_prefix=None, expected_suffix=None):
+    """Validate surrounding opcode context at a patch location.
+    Reads 16-32 bytes before and after, checks instruction-like patterns.
+    Handles both x86-64 and ARM64 code regions.
+    Returns True if context appears valid."""
+    if not isinstance(binary_data, (bytes, bytearray)):
+        return False
+    n = len(binary_data)
+    if offset < 0 or offset >= n:
+        return False
+    before = min(32, offset)
+    after = min(32, n - offset)
+    if before < 16 or after < 16:
+        return False
+    pre = binary_data[offset - before:offset]
+    suf = binary_data[offset:offset + after]
+    # Check that region is not all zeros or all 0xFF (data/padding)
+    if pre == b'\x00' * len(pre) or pre == b'\xff' * len(pre):
+        return False
+    if suf == b'\x00' * len(suf) or suf == b'\xff' * len(suf):
+        return False
+    # Detect ARM64 context (4-byte aligned instructions, common ARM64 patterns)
+    is_arm64 = False
+    if offset % 4 == 0 and len(pre) >= 16:
+        # Check if the region looks like ARM64 (many 4-byte aligned values
+        # with common ARM64 top nibbles)
+        arm64_like = 0
+        for i in range(0, min(16, len(pre)) - 3, 4):
+            top_byte = pre[i + 3]
+            if top_byte in (0xD6, 0xF9, 0xA9, 0x52, 0x72, 0xB9, 0x91, 0xD2,
+                            0x94, 0x97, 0x54, 0x36, 0x37, 0x34, 0x35, 0x14,
+                            0x17, 0xAA, 0x2A, 0x6B, 0xEB, 0x71, 0xF1):
+                arm64_like += 1
+        if arm64_like >= 2:
+            is_arm64 = True
+    if is_arm64:
+        # ARM64 validation: check for reasonable instruction density
+        arm_valid = 0
+        for i in range(0, min(16, len(pre)) - 3, 4):
+            word = struct.unpack_from('<I', pre, i)[0]
+            # Common ARM64 instruction classes (rough check on top bits)
+            top4 = (word >> 28) & 0xF
+            if top4 in (0x0, 0x1, 0x2, 0x3, 0x5, 0x6, 0x7, 0x9, 0xA, 0xB, 0xD, 0xF):
+                arm_valid += 1
+        return arm_valid >= 2
+    # x86-64 opcode density: expect some bytes that look like opcodes
+    opcode_like = sum(1 for b in pre[-16:] if b in _COMMON_OPCODES or b in _OPCODE_PREFIXES)
+    if opcode_like < 2:
+        return False
+    if expected_prefix is not None:
+        exp = expected_prefix if isinstance(expected_prefix, bytes) else bytes.fromhex(expected_prefix.replace(' ', ''))
+        if len(exp) > 0 and len(suf) >= len(exp) and suf[:len(exp)] != exp:
+            return False
+    if expected_suffix is not None:
+        exp = expected_suffix if isinstance(expected_suffix, bytes) else bytes.fromhex(expected_suffix.replace(' ', ''))
+        if len(exp) > 0 and len(pre) >= len(exp) and pre[-len(exp):] != exp:
+            return False
+    return True
+
+
+def compute_function_fingerprint(binary_data, offset, window=96):
+    """Compute a stable hash of the surrounding function region.
+    Masks immediate values (operands of mov, call, jmp, lea, cmp) to reduce
+    sensitivity to small constant or address changes. Returns hex digest string."""
+    n = len(binary_data)
+    if offset < 0 or offset >= n:
+        return ""
+    half = window // 2
+    start = max(0, offset - half)
+    end = min(n, offset + half)
+    if end - start < 16:
+        return ""
+    region = bytearray(binary_data[start:end])
+    rlen = len(region)
+    # Mask potential immediates to produce a stable fingerprint
+    i = 0
+    while i < rlen - 2:
+        b0 = region[i]
+        b1 = region[i + 1] if i + 1 < rlen else 0
+        # MOV r32, imm32 (B8-BF)
+        if 0xB8 <= b0 <= 0xBF and i + 5 <= rlen:
+            for j in range(1, 5):
+                region[i + j] = 0
+            i += 5
+            continue
+        # REX.W + MOV r64, imm64 (48 B8-BF)
+        if b0 == 0x48 and 0xB8 <= b1 <= 0xBF and i + 10 <= rlen:
+            for j in range(2, 10):
+                region[i + j] = 0
+            i += 10
+            continue
+        # CALL rel32 / JMP rel32 (E8 / E9)
+        if b0 in (0xE8, 0xE9) and i + 5 <= rlen:
+            for j in range(1, 5):
+                region[i + j] = 0
+            i += 5
+            continue
+        # JMP rel8 / Jcc rel8 (EB / 70-7F)
+        if b0 == 0xEB or (0x70 <= b0 <= 0x7F):
+            if i + 2 <= rlen:
+                region[i + 1] = 0
+            i += 2
+            continue
+        # MOV r/m, imm32 with REX (48 C7)
+        if b0 == 0x48 and b1 == 0xC7 and i + 7 <= rlen:
+            # Mask the imm32 (bytes 3-6 from start, assuming ModRM at +2)
+            for j in range(3, 7):
+                if i + j < rlen:
+                    region[i + j] = 0
+            i += 7
+            continue
+        # LEA with RIP-relative (48 8D 05/0D/15/1D/25/2D/35/3D)
+        if b0 in (0x48, 0x4C) and b1 == 0x8D and i + 6 <= rlen:
+            for j in range(3, min(7, rlen - i)):
+                region[i + j] = 0
+            i += 7
+            continue
+        # Two-byte Jcc rel32 (0F 80-8F)
+        if b0 == 0x0F and 0x80 <= b1 <= 0x8F and i + 6 <= rlen:
+            for j in range(2, 6):
+                region[i + j] = 0
+            i += 6
+            continue
+        i += 1
+    return hashlib.sha1(bytes(region)).hexdigest()
+
+
+def _detect_function_boundary(binary_data, offset, direction=-1, max_scan=512):
+    """Scan for probable function boundaries near offset.
+
+    Looks for alignment padding (CC CC, 90 90, 66 2E 0F 1F), RET+padding,
+    or common function prologues to estimate if offset is inside valid code.
+
+    Args:
+        binary_data: raw binary bytes
+        offset: position to scan from
+        direction: -1 for backward (find start), +1 for forward (find end)
+        max_scan: maximum bytes to scan
+
+    Returns (boundary_offset, confidence) or (None, 0).
+    """
+    n = len(binary_data)
+    if offset < 0 or offset >= n:
+        return None, 0
+
+    # MSVC int3 padding: CC CC CC CC
+    # Clang NOP padding: 66 2E 0F 1F, 0F 1F 84 00, 90 90 90
+    # Function end: C3 (ret) followed by padding
+
+    if direction < 0:
+        # Scan backward for function start
+        start = max(0, offset - max_scan)
+        for i in range(offset - 1, start, -1):
+            b = binary_data[i]
+            # 4+ bytes of CC padding => function boundary just after
+            if b == 0xCC and i + 4 <= n:
+                run = 0
+                for j in range(i, min(i + 8, n)):
+                    if binary_data[j] == 0xCC:
+                        run += 1
+                    else:
+                        break
+                if run >= 3:
+                    boundary = i + run
+                    if boundary <= offset:
+                        return boundary, 8
+            # Clang: ret followed by NOP alignment
+            if b == 0xC3 and i + 2 <= n:
+                nxt = binary_data[i + 1]
+                if nxt in (0x90, 0x66, 0x0F, 0xCC):
+                    boundary = i + 1
+                    # Advance past NOPs
+                    while boundary < n and binary_data[boundary] in (0x90, 0xCC):
+                        boundary += 1
+                    if boundary <= offset:
+                        return boundary, 6
+        return None, 0
+    else:
+        # Scan forward for function end
+        end = min(n, offset + max_scan)
+        for i in range(offset, end):
+            b = binary_data[i]
+            if b == 0xC3 and i > offset + 4:
+                # Check for padding after ret
+                if i + 1 < n and binary_data[i + 1] in (0xCC, 0x90, 0x66, 0x0F):
+                    return i, 7
+                # ret at end of a basic block (next byte is a new function prologue)
+                if i + 1 < n and binary_data[i + 1] in (0x55, 0x56, 0x57, 0x41, 0x53):
+                    return i, 5
+            # CC padding block
+            if b == 0xCC and i + 3 < n:
+                if binary_data[i + 1] == 0xCC and binary_data[i + 2] == 0xCC:
+                    return i, 7
+        return None, 0
+
+
+def _estimate_instruction_flow(binary_data, offset, count=8):
+    """Estimate whether bytes at offset form a plausible x86-64 instruction
+    stream by checking for valid instruction prefixes and opcode patterns.
+
+    Walks forward from offset, using simplified length estimation for common
+    instruction forms. Returns (valid_count, total_checked) where valid_count
+    is how many instructions looked plausible.
+    """
+    n = len(binary_data)
+    pos = offset
+    valid = 0
+    checked = 0
+
+    # REX prefixes (0x40-0x4F), common opcodes, and mandatory prefixes
+    rex_range = range(0x40, 0x50)
+    mandatory_prefixes = (0x66, 0xF2, 0xF3)
+    # Simplified length table for common single-byte opcodes
+    # Maps first byte -> (min_length, max_length) for the full instruction
+    _LEN_HINTS = {
+        0x50: (1, 1), 0x51: (1, 1), 0x52: (1, 1), 0x53: (1, 1),
+        0x54: (1, 1), 0x55: (1, 1), 0x56: (1, 1), 0x57: (1, 1),
+        0x58: (1, 1), 0x59: (1, 1), 0x5A: (1, 1), 0x5B: (1, 1),
+        0x5C: (1, 1), 0x5D: (1, 1), 0x5E: (1, 1), 0x5F: (1, 1),
+        0x90: (1, 1), 0xC3: (1, 1), 0xCC: (1, 1), 0xCB: (1, 1),
+        0xC9: (1, 1),
+        0xE8: (5, 5), 0xE9: (5, 5),  # call/jmp rel32
+        0xEB: (2, 2),  # jmp rel8
+        0x74: (2, 2), 0x75: (2, 2), 0x70: (2, 2), 0x71: (2, 2),
+        0x72: (2, 2), 0x73: (2, 2), 0x76: (2, 2), 0x77: (2, 2),
+        0x78: (2, 2), 0x79: (2, 2), 0x7A: (2, 2), 0x7B: (2, 2),
+        0x7C: (2, 2), 0x7D: (2, 2), 0x7E: (2, 2), 0x7F: (2, 2),
+        0xB8: (5, 5), 0xB9: (5, 5), 0xBA: (5, 5), 0xBB: (5, 5),
+        0xBC: (5, 5), 0xBD: (5, 5), 0xBE: (5, 5), 0xBF: (5, 5),
+    }
+
+    while checked < count and pos < n - 1:
+        b0 = binary_data[pos]
+        step = 0
+
+        # Skip REX prefix
+        adj_pos = pos
+        if b0 in rex_range:
+            adj_pos += 1
+            if adj_pos >= n:
+                break
+            b0_inner = binary_data[adj_pos]
+        else:
+            b0_inner = b0
+
+        if b0_inner in _LEN_HINTS:
+            mn, mx = _LEN_HINTS[b0_inner]
+            step = mn + (adj_pos - pos)
+            valid += 1
+        elif b0 in mandatory_prefixes or b0 in rex_range:
+            # Prefixed instruction: assume 2-7 bytes total, accept as plausible
+            step = 3
+            valid += 1
+        elif b0 in (0x0F,):
+            # Two-byte opcode escape
+            step = 3
+            valid += 1
+        elif b0 in _COMMON_OPCODES or b0 in _OPCODE_PREFIXES:
+            step = 2
+            valid += 1
+        else:
+            # Unknown but not necessarily invalid
+            step = 2
+
+        checked += 1
+        pos += max(step, 1)
+
+    return valid, checked
+
+
+def run_heuristic_analysis(binary_data, offset, patch_len=4):
+    """Analyze opcode patterns and structural context around offset.
+
+    Performs multiple heuristic checks:
+    - Function boundary proximity (is offset inside a plausible function?)
+    - Instruction flow continuity (do surrounding bytes decode plausibly?)
+    - Common opcode pattern density
+    - Prologue/epilogue proximity
+
+    Returns (ok, score) where score contributes to confidence (max 15).
+    """
+    if offset < 32 or offset + 32 > len(binary_data):
+        return False, 0
+    score = 0
+    pre = binary_data[offset - 24:offset]
+    suf = binary_data[offset:offset + 24]
+
+    # --- Check 1: Function boundary detection ---
+    # If we can find a plausible function start before this offset,
+    # it increases confidence that we are in real code.
+    bound_start, bound_conf = _detect_function_boundary(binary_data, offset, direction=-1, max_scan=1024)
+    if bound_start is not None:
+        dist = offset - bound_start
+        if dist < 4096:
+            score += 3
+    bound_end, end_conf = _detect_function_boundary(binary_data, offset, direction=+1, max_scan=1024)
+    if bound_end is not None:
+        dist = bound_end - offset
+        if dist < 4096:
+            score += 2
+
+    # --- Check 2: Instruction flow continuity ---
+    valid_insns, checked = _estimate_instruction_flow(binary_data, max(0, offset - 16), count=6)
+    if checked > 0 and valid_insns >= (checked * 2 // 3):
+        score += 3
+    valid_after, checked_after = _estimate_instruction_flow(binary_data, offset, count=6)
+    if checked_after > 0 and valid_after >= (checked_after * 2 // 3):
+        score += 2
+
+    # --- Check 3: Function prologue patterns nearby ---
+    if pre[-1] in (0x55, 0x53, 0x56, 0x57):
+        score += 2
+    if len(pre) >= 3 and pre[-3] == 0x48 and pre[-2] == 0x83 and pre[-1] == 0xEC:
+        score += 2
+    # push rbp; mov rbp, rsp (55 48 89 E5)
+    for i in range(len(pre) - 4):
+        if pre[i:i+4] == b'\x55\x48\x89\xe5':
+            score += 2
+            break
+
+    # --- Check 4: Common mov/cmp/call patterns ---
+    for i in range(len(pre) - 2):
+        if pre[i] in (0x48, 0x49, 0x4C) and pre[i + 1] in (0x89, 0x8B, 0xC7, 0x09, 0x01):
+            score += 2
+            break
+
+    # --- Check 5: Epilogue or control flow in suffix ---
+    for i in range(min(16, len(suf) - 1)):
+        if suf[i] == 0xC3:
+            score += 2
+            break
+        if suf[i] in (0x74, 0x75, 0x0F) and i + 1 < len(suf):
+            score += 1
+            break
+
+    # --- Check 6: Opcode density in surrounding region ---
+    region = binary_data[max(0, offset - 32):min(len(binary_data), offset + 32)]
+    opcode_hits = sum(1 for b in region if b in _COMMON_OPCODES or b in _OPCODE_PREFIXES)
+    density = opcode_hits / max(len(region), 1)
+    if density > 0.15:
+        score += 2
+
+    return score >= 5, min(15, score)
+
+
+def calculate_confidence(signature_match, context_valid, original_bytes_match,
+                         fingerprint_match, heuristic_score):
+    """Aggregate confidence from validation signals. Returns integer 0-100+."""
+    total = 0
+    if signature_match:
+        total += CONFIDENCE_SIGNATURE_MATCH
+    if context_valid:
+        total += CONFIDENCE_CONTEXT_VALID
+    if original_bytes_match:
+        total += CONFIDENCE_ORIGINAL_BYTES
+    if fingerprint_match:
+        total += CONFIDENCE_FINGERPRINT_MATCH
+    total += min(CONFIDENCE_HEURISTIC_PATTERN, heuristic_score)
+    return total
+
+
+def validate_patch_site(binary_data, offset, expected_original_bytes, patch_bytes,
+                        patch_name="", known_fingerprints=None, expected_prefix=None,
+                        expected_suffix=None):
+    """Validate a patch location without writing. Returns (ok, confidence, messages)."""
+    messages = []
+    if offset < 0 or offset >= len(binary_data):
+        return False, 0, ["offset out of bounds"]
+    # Normalize byte inputs
+    if isinstance(expected_original_bytes, str):
+        exp_orig = bytes.fromhex(expected_original_bytes.replace(' ', '')) if expected_original_bytes.strip() else b''
+    else:
+        exp_orig = expected_original_bytes or b''
+    if isinstance(patch_bytes, str):
+        patch_b = bytes.fromhex(patch_bytes.replace(' ', '')) if patch_bytes.strip() else b''
+    else:
+        patch_b = patch_bytes or b''
+    read_len = max(len(exp_orig), len(patch_b), 1)
+    if offset + read_len > len(binary_data):
+        return False, 0, ["patch region exceeds binary size"]
+    current = binary_data[offset:offset + read_len]
+    # Pre-patch byte validation
+    orig_match = True
+    if len(exp_orig) > 0:
+        if current[:len(exp_orig)] != exp_orig:
+            orig_match = False
+            messages.append("unexpected bytes at patch location")
+    # Context validation
+    ctx_ok = validate_context(binary_data, offset, expected_prefix, expected_suffix)
+    if not ctx_ok:
+        messages.append("context validation failed")
+    # Fingerprint check
+    fp = compute_function_fingerprint(binary_data, offset)
+    fp_match = False
+    if known_fingerprints and fp and fp in known_fingerprints:
+        fp_match = True
+    elif known_fingerprints and fp:
+        messages.append("fingerprint mismatch")
+    # Heuristic analysis
+    heur_ok, heur_score = run_heuristic_analysis(binary_data, offset, len(patch_b))
+    if not heur_ok:
+        messages.append("heuristic analysis uncertain")
+    # Calculate aggregate confidence
+    conf = calculate_confidence(True, ctx_ok, orig_match, fp_match, heur_score)
+    ok = conf >= CONFIDENCE_THRESHOLD
+    return ok, conf, messages
+
+
+def safe_patch(binary_data, offset, expected_original_bytes, patch_bytes, context_info=None,
+               known_fingerprints=None, apply_patch=True):
+    """Full patch flow: validate, optionally apply, verify.
+    binary_data must be bytearray if apply_patch=True.
+    context_info: dict with optional expected_prefix, expected_suffix, patch_name.
+    Returns (success, message)."""
+    ctx = context_info or {}
+    patch_name = ctx.get("patch_name", "")
+    exp_prefix = ctx.get("expected_prefix")
+    exp_suffix = ctx.get("expected_suffix")
+    ok, conf, messages = validate_patch_site(
+        binary_data, offset, expected_original_bytes, patch_bytes,
+        patch_name=patch_name, known_fingerprints=known_fingerprints,
+        expected_prefix=exp_prefix, expected_suffix=exp_suffix)
+    if not ok:
+        msg = "; ".join(messages) if messages else f"confidence {conf} < {CONFIDENCE_THRESHOLD}"
+        print(f"[warn] patch validation failed for {patch_name}: {msg}")
+        return False, msg
+    if not apply_patch:
+        print(f"[info] patch site validated for {patch_name} (confidence {conf})")
+        return True, f"validated (conf={conf})"
+    patch_b = patch_bytes if isinstance(patch_bytes, bytes) else bytes.fromhex(patch_bytes.replace(' ', ''))
+    exp_orig = expected_original_bytes if isinstance(expected_original_bytes, bytes) else bytes.fromhex(expected_original_bytes.replace(' ', ''))
+    current = bytes(binary_data[offset:offset + len(exp_orig)]) if len(exp_orig) > 0 else b''
+    if len(exp_orig) > 0 and current != exp_orig:
+        print(f"[warn] unexpected bytes at patch location, skipping")
+        return False, "pre-patch byte validation failed"
+    if not isinstance(binary_data, bytearray):
+        print(f"[warn] binary_data must be bytearray to apply patch")
+        return False, "invalid buffer type"
+    binary_data[offset:offset + len(patch_b)] = patch_b
+    verify = bytes(binary_data[offset:offset + len(patch_b)])
+    if verify != patch_b:
+        print(f"[error] patch verification failed")
+        return False, "post-patch verification failed"
+    print(f"[ok] patch applied successfully")
+    return True, "ok"
+
+
+def _run_patch_site_validation(data, file_offset, sig_or_dict, adj=0):
+    """Helper: run validation for a discovered offset. sig_or_dict is Signature or
+    dict with 'o','x','n' (orig, patch, name). Returns (ok, confidence, messages)."""
+    if hasattr(sig_or_dict, 'expected_original') and hasattr(sig_or_dict, 'patch_bytes'):
+        exp = sig_or_dict.expected_original or ''
+        patch = sig_or_dict.patch_bytes or ''
+        name = getattr(sig_or_dict, 'name', '')
+    else:
+        exp = sig_or_dict.get('o', '') or ''
+        patch = sig_or_dict.get('x', '') or ''
+        name = sig_or_dict.get('n', '') or ''
+    # Skip validation for dynamic patches (injected code, stubs)
+    if patch.startswith('<'):
+        return True, 100, []
+    if not exp and not patch:
+        return True, 100, []
+    try:
+        exp_b = bytes.fromhex(exp.replace(' ', '')) if exp.strip() else b''
+    except ValueError:
+        exp_b = b''
+    try:
+        patch_b = bytes.fromhex(patch.replace(' ', '')) if patch.strip() else b''
+    except ValueError:
+        patch_b = b''
+    if not exp_b and not patch_b:
+        return True, 100, []
+    if file_offset < 0 or file_offset >= len(data):
+        return False, 0, ["offset out of bounds"]
+    read_len = max(len(exp_b), len(patch_b))
+    if file_offset + read_len > len(data):
+        return False, 0, ["patch region exceeds binary size"]
+    ok, conf, msgs = validate_patch_site(data, file_offset, exp_b or patch_b, patch_b or exp_b,
+                                          patch_name=name)
+    return ok, conf, msgs
+
+
+# endregion Patch Safety and Heuristics
 
 
 # region Offset Discovery Engine
@@ -1717,7 +2359,7 @@ def find_offset(data, sig, text_start=0, text_end=None):
 def _topo_sort_derivations(derivations):
     """Sort derivation keys so parents resolve before children.
 
-    This ensures EmulateBitrateModified resolves before DuplicateEmulateBitrateModified."""
+    This ensures parent anchors resolve before derived offsets."""
     all_derived = set(derivations.keys())
     order = []
     visited = set()
@@ -1741,6 +2383,7 @@ def _all_offset_names():
     return list(ALL_OFFSET_NAMES)
 
 
+# Exactly 17 offsets (same set as Windows/Linux patchers). No BWE/Cwnd/DuplicateBitrate.
 ALL_OFFSET_NAMES = [
     "CreateAudioFrameStereo",
     "AudioEncoderOpusConfigSetChannels",
@@ -1757,33 +2400,11 @@ ALL_OFFSET_NAMES = [
     "DownmixFunc",
     "AudioEncoderOpusConfigIsOk",
     "ThrowError",
-    "DuplicateEmulateBitrateModified",
     "EncoderConfigInit1",
     "EncoderConfigInit2",
 ]
 
-WINDOWS_PATCHER_OFFSET_NAMES = [
-    "CreateAudioFrameStereo",
-    "AudioEncoderOpusConfigSetChannels",
-    "MonoDownmixer",
-    "EmulateStereoSuccess1",
-    "EmulateStereoSuccess2",
-    "EmulateBitrateModified",
-    "SetsBitrateBitrateValue",
-    "SetsBitrateBitwiseOr",
-    "Emulate48Khz",
-    "HighPassFilter",
-    "HighpassCutoffFilter",
-    "DcReject",
-    "DownmixFunc",
-    "AudioEncoderOpusConfigIsOk",
-    "ThrowError",
-    "EncoderConfigInit1",
-    "EncoderConfigInit2",
-    "DuplicateEmulateBitrateModified",
-    "BWE_Thr2",
-    "BWE_Thr3",
-]
+WINDOWS_PATCHER_OFFSET_NAMES = list(ALL_OFFSET_NAMES)
 
 PATCHER_OFFSET_NAMES = WINDOWS_PATCHER_OFFSET_NAMES
 
@@ -1844,16 +2465,13 @@ def _run_heuristic_scan(data, missing_names, adj, text_start, text_end):
     hints = []
 
     # --- Bitrate imul patterns: search for `imul reg, reg/rm, 0x7D00` (32000) ---
-    if "EmulateBitrateModified" in missing_names or "DuplicateEmulateBitrateModified" in missing_names:
+    if "EmulateBitrateModified" in missing_names:
         imul_pat = Signature._parse("69 ?? 00 7D 00 00")
         matches = scan_pattern(data, imul_pat, start=text_start, end=text_end)
         for m in matches:
             candidate_file = m + 2
             reason = f"imul *,32000 @file:0x{m:X}"
-            if "EmulateBitrateModified" in missing_names:
-                hints.append(("EmulateBitrateModified", candidate_file, reason))
-            if "DuplicateEmulateBitrateModified" in missing_names:
-                hints.append(("DuplicateEmulateBitrateModified", candidate_file, reason))
+            hints.append(("EmulateBitrateModified", candidate_file, reason))
 
     # --- 48000/32000 constant pair for CreateAudioFrameStereo ---
     if "CreateAudioFrameStereo" in missing_names:
@@ -1958,34 +2576,15 @@ def _cross_validate(results, adj, data, tiers_used=None):
             f = results[name] - adj
             if 0 <= f and f + 4 <= len(data):
                 val = data[f:f+4]
-                if val != b'\x00\x7D\x00\x00' and val != b'\x80\x1A\x06\x00':
+                if val != b'\x00\x7D\x00\x00' and val != b'\x00\xDC\x05\x00':
                     warnings.append(f"{name}: unexpected config bytes {val.hex(' ')} "
                                     f"(expected 00 7D 00 00 or 00 DC 05 00)")
-
-    bitrate_names = ["EmulateBitrateModified", "DuplicateEmulateBitrateModified"]
-    both_independent = all(
-        not tiers.get(n, '').startswith('derived') for n in bitrate_names
-    )
-    if both_independent:
-        bitrate_vals = {}
-        for name in bitrate_names:
-            if name in results:
-                f = results[name] - adj
-                if 0 <= f and f + 3 <= len(data):
-                    bitrate_vals[name] = data[f:f+3]
-        if len(bitrate_vals) == 2:
-            vals = list(bitrate_vals.values())
-            if vals[0] != vals[1]:
-                warnings.append(
-                    f"Bitrate mismatch: {bitrate_names[0]}={vals[0].hex(' ')} vs "
-                    f"{bitrate_names[1]}={vals[1].hex(' ')}"
-                )
 
     return warnings
 
 
 BITRATE_OFFSET_NAMES = [
-    "EmulateBitrateModified", "SetsBitrateBitrateValue", "DuplicateEmulateBitrateModified",
+    "EmulateBitrateModified", "SetsBitrateBitrateValue",
     "EncoderConfigInit1", "EncoderConfigInit2",
 ]
 
@@ -2168,10 +2767,8 @@ def discover_offsets_arm64(data, arm64_info):
         elif method == 'arm64-hint':
             print(f"  [HINT] {offset_name:45s} function '{safe_sym}' - scan did not match")
 
-    # Fallback: if EmulateBitrateModified or DuplicateEmulateBitrateModified still
-    # missing, scan arm64 slice for 32-bit literal 32000 (0x00007D00).
-    bitrate_missing = [n for n in ("EmulateBitrateModified", "DuplicateEmulateBitrateModified") if n not in results]
-    if bitrate_missing:
+    # Fallback: if EmulateBitrateModified still missing, scan arm64 for 32-bit literal 32000 (0x00007D00).
+    if "EmulateBitrateModified" not in results:
         slice_start = fat_offset
         slice_end = fat_offset + arm64_info.get('fat_size', 0)
         if slice_end > len(data):
@@ -2183,23 +2780,11 @@ def discover_offsets_arm64(data, arm64_info):
             if data[i:i + 4] == literal_32000 and data[i:i + 3] == orig_low3:
                 candidates.append(i)
         if candidates:
-            if "EmulateBitrateModified" in bitrate_missing and len(candidates) >= 1:
-                results["EmulateBitrateModified"] = candidates[0] + adj
-                tiers_used["EmulateBitrateModified"] = "arm64-literal-32000(1st)"
-                print(f"  [SCAN] {'EmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000]")
-            if "DuplicateEmulateBitrateModified" in bitrate_missing and len(candidates) >= 2:
-                results["DuplicateEmulateBitrateModified"] = candidates[1] + adj
-                tiers_used["DuplicateEmulateBitrateModified"] = "arm64-literal-32000(2nd)"
-                print(f"  [SCAN] {'DuplicateEmulateBitrateModified':45s} = 0x{candidates[1] + adj:X}  (file 0x{candidates[1]:X})  [literal 32000]")
-            elif "DuplicateEmulateBitrateModified" in bitrate_missing and len(candidates) == 1:
-                results["DuplicateEmulateBitrateModified"] = candidates[0] + adj
-                tiers_used["DuplicateEmulateBitrateModified"] = "arm64-literal-32000(only)"
-                print(f"  [SCAN] {'DuplicateEmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000 only]")
+            results["EmulateBitrateModified"] = candidates[0] + adj
+            tiers_used["EmulateBitrateModified"] = "arm64-literal-32000(1st)"
+            print(f"  [SCAN] {'EmulateBitrateModified':45s} = 0x{candidates[0] + adj:X}  (file 0x{candidates[0]:X})  [literal 32000]")
 
-    fat_offset = arm64_info.get("fat_offset", 0)
-    slice_len = arm64_info.get("fat_size", 0)
-    slice_data = data[fat_offset : fat_offset + slice_len] if slice_len else b""
-    validation_failures = _validate_discovered_offsets(results, slice_data, adj)
+    validation_failures = _validate_discovered_offsets(results, data, adj)
     for name, reason in validation_failures:
         results.pop(name, None)
         tiers_used.pop(name, None)
@@ -2316,9 +2901,17 @@ def discover_offsets(data, bin_info):
             print(f"  [FAIL] {sig.name}: {err}")
             errors.append((sig.name, err))
         else:
+            print(f"  [info] signature match at offset 0x{file_off:X}")
+            ok, conf, val_msgs = _run_patch_site_validation(data, file_off, sig, adj)
+            if not ok:
+                for m in val_msgs:
+                    print(f"  [warn] {m}")
+                print(f"  [warn] {sig.name}: validation failed (confidence {conf} < {CONFIDENCE_THRESHOLD}), skipping")
+                errors.append((sig.name, f"confidence {conf} < {CONFIDENCE_THRESHOLD}"))
+                continue
             config_off = file_off + adj
             tag = "OK" if tier == "primary" else "ALT"
-            print(f"  [{tag:4s}] {sig.name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}]")
+            print(f"  [{tag:4s}] {sig.name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}] (conf={conf})")
 
             if sig.expected_original:
                 expected = bytes.fromhex(sig.expected_original.replace(' ', ''))
@@ -2377,13 +2970,17 @@ def discover_offsets(data, bin_info):
                 if len(resolved) >= 1:
                     file_off = resolved[0] + target_off
                     if 0 <= file_off < len(data):
-                        config_off = file_off + adj
-                        ambig = f"(ambig:{len(resolved)})" if len(resolved) > 1 else ""
-                        tier = f"clang-alt{ambig}"
-                        print(f"  [CLNG] {sig_name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}]")
-                        results[sig_name] = config_off
-                        tiers_used[sig_name] = tier
-                        still_missing = [n for n in still_missing if n != sig_name]
+                        ok, conf, _ = _run_patch_site_validation(data, file_off, orig_sig or {}, adj)
+                        if not ok:
+                            print(f"  [warn] {sig_name}: validation failed (confidence {conf}), skipping")
+                        else:
+                            config_off = file_off + adj
+                            ambig = f"(ambig:{len(resolved)})" if len(resolved) > 1 else ""
+                            tier = f"clang-alt{ambig}"
+                            print(f"  [CLNG] {sig_name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}] (conf={conf})")
+                            results[sig_name] = config_off
+                            tiers_used[sig_name] = tier
+                            still_missing = [n for n in still_missing if n != sig_name]
 
             if still_missing:
                 print(f"  Still missing after Clang alts: {', '.join(still_missing)}")
@@ -2502,14 +3099,24 @@ def discover_offsets(data, bin_info):
                     found = True
                     break
 
-        # If exact worked without verification (no expected bytes), accept it
+        # If exact worked without verification (no expected bytes), accept it.
+        # Do NOT accept if expected bytes exist and failed to match.
         if not found:
+            _exp_drv = _build_expected_map(fmt)
             for anchor_name, delta in paths:
                 if anchor_name not in results:
                     continue
                 config_off = results[anchor_name] + delta
                 file_off = config_off - adj
                 if 0 <= file_off < len(data):
+                    # Skip if we have expected bytes (verification failed earlier)
+                    has_expected = False
+                    if derived_name in _exp_drv:
+                        exp_hex, _ = _exp_drv[derived_name]
+                        if exp_hex:
+                            has_expected = True
+                    if has_expected:
+                        continue
                     print(f"  [ OK ] {derived_name:45s} = 0x{config_off:X}  (from {anchor_name} + 0x{delta:X})  [unverified]")
                     results[derived_name] = config_off
                     tiers_used[derived_name] = f"derived-unverified({anchor_name}+0x{delta:X})"
@@ -2556,51 +3163,8 @@ def discover_offsets(data, bin_info):
         errors.append((name, reason))
         print(f"  [INVALID] {name}: {reason}")
 
-    if fmt == "pe" and adj:
-        bwe = _discover_bwe_pe(data, adj)
-        for name, rva in bwe.items():
-            if name not in results:
-                results[name] = rva
-                tiers_used[name] = "bwe-scan"
-                print(f"  [BWE ] {name:45s} = 0x{rva:X}  (BuildBitrateTable imm32)")
-
     errors = [(n, e) for n, e in errors if n not in results]
     return results, errors, adj, tiers_used
-
-
-def _discover_bwe_pe(data, adj):
-    """Discover BWE (BuildBitrateTable) offsets for Windows PE. RVA = file_offset + adj."""
-    imm_518400 = struct.pack("<I", 518400)
-    imm_921600 = struct.pack("<I", 921600)
-    preferred_start, preferred_end = 0x43F000, 0x440000
-    thr2_candidates = []
-    thr3_candidates = []
-
-    for start in range(len(data) - 7):
-        if data[start] != 0xC7 or data[start + 1] != 0x40:
-            continue
-        imm = data[start + 3 : start + 7]
-        if imm == imm_518400:
-            thr2_candidates.append(start)
-        elif imm == imm_921600:
-            thr3_candidates.append(start)
-
-    out = {}
-    for cand in thr2_candidates:
-        if preferred_start <= cand < preferred_end:
-            out["BWE_Thr2"] = cand + adj
-            break
-    if "BWE_Thr2" not in out and thr2_candidates:
-        out["BWE_Thr2"] = thr2_candidates[0] + adj
-
-    for cand in thr3_candidates:
-        if preferred_start <= cand < preferred_end:
-            out["BWE_Thr3"] = cand + adj
-            break
-    if "BWE_Thr3" not in out and thr3_candidates:
-        out["BWE_Thr3"] = thr3_candidates[0] + adj
-
-    return out
 
 
 # endregion Offset Discovery Engine
@@ -2622,17 +3186,15 @@ EXPECTED_ORIGINALS = {
     "DownmixFunc":              ("41", 1),
     "HighpassCutoffFilter":     (None, 0x100),
     "DcReject":                 (None, 0x1B6),
-    "DuplicateEmulateBitrateModified": ("00 7D 00 00", 4),
     "EncoderConfigInit1":       ("00 7D 00 00", 4),
     "EncoderConfigInit2":       ("00 7D 00 00", 4),
-    "BWE_Thr2":                 (None, 7),
-    "BWE_Thr3":                 (None, 7),
 }
 
 EXPECTED_ORIGINALS_CLANG = {
     "DownmixFunc":              ("55", 1),
     "AudioEncoderOpusConfigIsOk": ("55 48 89 E5", 4),
-    "Emulate48Khz":             (None, 3),
+    "Emulate48Khz":             (None, 4),
+    "EmulateBitrateModified":   ("00 7D 00", 3),
     "HighpassCutoffFilter":     (None, 0x100),
     "DcReject":                 (None, 0x1B6),
 }
@@ -2646,6 +3208,8 @@ EXPECTED_ORIGINALS_LINUX_ONLY = {
 EXPECTED_ORIGINALS_MACHO_ONLY = {
     "ThrowError":               ("55", 1),
     "CreateAudioFrameStereo":   ("4C 0F 43 E0", 4),
+    "EmulateStereoSuccess2":    (None, 1),
+    "Emulate48Khz":             (None, 4),
 }
 
 EXPECTED_ORIGINALS_ARM64 = {
@@ -2691,11 +3255,8 @@ PATCH_INFO = {
     "DownmixFunc":              ("C3", "ret (disable downmix)"),
     "HighpassCutoffFilter":     ("<injected: hp_cutoff>", "Custom HP cutoff + gain"),
     "DcReject":                 ("<injected: dc_reject>", "Custom DC reject + gain"),
-    "DuplicateEmulateBitrateModified": (BITRATE_PATCH_4, "Dup bitrate 32000->384000"),
     "EncoderConfigInit1":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
     "EncoderConfigInit2":       (BITRATE_PATCH_4, "Config qword: 32000->384000"),
-    "BWE_Thr2":                 (BITRATE_PATCH_4, "BWE threshold: 518400->384000"),
-    "BWE_Thr3":                 (BITRATE_PATCH_4, "BWE threshold: 921600->384000"),
 }
 
 
@@ -2954,11 +3515,6 @@ PATCHER_DEBUG_GROUPS = {
     "ENCODER": [
         ("EncoderConfigInit1", "EncoderConfigInit1 (32000->384000)"),
         ("EncoderConfigInit2", "EncoderConfigInit2 (32000->384000)"),
-        ("DuplicateEmulateBitrateModified", "DuplicateEmulateBitrateModified (32000->384000)"),
-    ],
-    "BWE_384": [
-        ("BWE_Thr2", "BWE_Thr2 (518400->384000)"),
-        ("BWE_Thr3", "BWE_Thr3 (921600->384000)"),
     ],
 }
 
@@ -3514,9 +4070,7 @@ def main():
             print("=" * 65)
             print(ps_config)
 
-        if fmt == 'pe':
-            pass
-        elif fmt == 'elf':
+        if fmt == 'elf':
             linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
             if linux_block:
                 print("\n" + "=" * 65)
