@@ -146,6 +146,8 @@ SIGNATURES = [
         disambiguator=_mono_downmixer_disambiguator,
         alt_patterns=[
             ("48 89 ?? E8 ?? ?? ?? ?? 84 C0 ?? ?? 83 ?? ?? ?? 00 00 09 0F 8F", 8),
+            ("4C 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 7B ?? 09 0F 8F", 8),
+            ("4C 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 7B ?? 09 7F", 8),
         ],
     ),
 
@@ -237,6 +239,10 @@ CLANG_ALT_PATTERNS = [
      "48 89 FF E8 ?? ?? ?? ?? 84 C0 74 ?? 83 ?? ?? ?? 00 00 09 0F 8F", 8),
     ("MonoDownmixer",
      "F3 0F 1E FA ?? 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 ?? ?? ?? 00 00 09 0F 8F", 12),
+    ("MonoDownmixer",
+     "4C 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 7B ?? 09 0F 8F", 8),
+    ("MonoDownmixer",
+     "4C 89 ?? E8 ?? ?? ?? ?? 84 C0 74 ?? 83 7B ?? 09 7F", 8),
     ("SetsBitrateBitrateValue",
      "89 F8 48 ?? ?? ?? ?? ?? 01 00 00 00 48 09 ?? 48 89 ?? ??", 4),
     ("SetsBitrateBitrateValue",
@@ -1315,14 +1321,50 @@ def _linux_scan_within_function(data, func_start, func_size, scan_type, adj):
         return None
 
     if scan_type == "mono_downmix_test":
-        # test al,al ; je +0x0D ; cmp dword [rbx+off], 9 ; jg
-        # 84 C0 74 0D 83 BB xx xx 00 00 09 0F 8F
-        for i in range(flen - 14):
-            if (func[i:i+4] == b'\x84\xc0\x74\x0d'
-                    and func[i+4] == 0x83 and func[i+10] == 0x09
-                    and func[i+11:i+13] == b'\x0f\x8f'):
-                return func_start + i + adj
-        return None
+        # test al,al ; jz XX ; cmp dword [rbx+disp], 9 ; jg
+        # Two cmp encodings exist across builds:
+        #   Long disp32: 83 BB/BE xx xx 00 00 09  (0.0.93+, disp >= 0x80)
+        #   Short disp8: 83 7B/7E xx 09           (0.0.84, disp < 0x80)
+        # jg can be near (0F 8F) or short (7F). Prefer near jg first — patcher NOP sled
+        # length matches the near-jg layout on builds that have both in one function.
+        def _mono_match_at(i):
+            if func[i:i+2] != b'\x84\xc0' or func[i+2] != 0x74:
+                return None
+            cmp_start = i + 4
+            if cmp_start >= flen - 4 or func[cmp_start] != 0x83:
+                return None
+            modrm = func[cmp_start + 1]
+            if ((modrm >> 3) & 7) != 7:
+                return None
+            mod = modrm >> 6
+            if mod == 1 and cmp_start + 4 <= flen:
+                imm_off = cmp_start + 3
+            elif mod == 2 and cmp_start + 7 <= flen:
+                imm_off = cmp_start + 6
+            else:
+                return None
+            if func[imm_off] != 0x09:
+                return None
+            jg_off = imm_off + 1
+            if jg_off >= flen:
+                return None
+            j0 = func[jg_off]
+            if j0 == 0x0F and jg_off + 1 < flen and func[jg_off + 1] in (0x8F, 0x8D):
+                return ("near", func_start + i + adj)
+            if j0 in (0x7F, 0x7D):
+                return ("short", func_start + i + adj)
+            return None
+
+        short_best = None
+        for i in range(flen - 8):
+            m = _mono_match_at(i)
+            if not m:
+                continue
+            kind, off = m
+            if kind == "near":
+                return off
+            short_best = off
+        return short_best
 
     return None
 
@@ -1596,30 +1638,6 @@ def _arm64_scan_within_function(data, func_start, func_size, scan_type, adj):
                 r2 = _read32(func, i + j)
                 if (r2 & 0xFFFFFC1F) == 0x7100241F:
                     return func_start + i + adj
-        return None
-
-    if scan_type == "arm64_dup_bitrate_modified":
-        # DuplicateEmulateBitrateModified: second occurrence of MOVZ wN, #32000
-        # in CommitAudioCodec (first is EmulateBitrateModified). If compiler uses
-        # literal pool, find second 32-bit literal 0x00007D00 in function + pool.
-        count = 0
-        for i in range(0, flen - 4, 4):
-            raw = _read32(func, i)
-            if _is_movz_w(raw, 32000):
-                count += 1
-                if count == 2:
-                    return func_start + i + adj
-        # Fallback: second occurrence of 32000 literal in function + literal pool
-        literal_32000 = struct.pack('<I', 32000)
-        search_end = min(func_start + flen + 2048, len(data) - 4)
-        occurrences = []
-        for i in range(func_start, search_end - 3):
-            if data[i:i + 4] == literal_32000:
-                occurrences.append(i)
-        if len(occurrences) >= 2:
-            return occurrences[1] + adj
-        if len(occurrences) == 1:
-            return occurrences[0] + adj
         return None
 
     return None
@@ -1928,9 +1946,12 @@ def validate_context(binary_data, offset, expected_prefix=None, expected_suffix=
 
 
 def compute_function_fingerprint(binary_data, offset, window=96):
-    """Compute a stable hash of the surrounding function region.
+    """Compute a stable hash of the surrounding function region (x86-64 only).
     Masks immediate values (operands of mov, call, jmp, lea, cmp) to reduce
-    sensitivity to small constant or address changes. Returns hex digest string."""
+    sensitivity to small constant or address changes. Returns hex digest string.
+
+    Used when known_fingerprints is passed; the main discovery path does not
+    supply fingerprints—signature + expected bytes are enough."""
     n = len(binary_data)
     if offset < 0 or offset >= n:
         return ""
@@ -2258,60 +2279,25 @@ def validate_patch_site(binary_data, offset, expected_original_bytes, patch_byte
     ctx_ok = validate_context(binary_data, offset, expected_prefix, expected_suffix)
     if not ctx_ok:
         messages.append("context validation failed")
-    # Fingerprint check
+    # Fingerprint check (optional; main pipeline does not pass known_fingerprints)
     fp = compute_function_fingerprint(binary_data, offset)
     fp_match = False
     if known_fingerprints and fp and fp in known_fingerprints:
         fp_match = True
     elif known_fingerprints and fp:
         messages.append("fingerprint mismatch")
-    # Heuristic analysis
+    # Heuristic analysis (x86-centric opcode/boundary checks)
     heur_ok, heur_score = run_heuristic_analysis(binary_data, offset, len(patch_b))
-    if not heur_ok:
+    # When expected original bytes already match, trust that over heuristic layout
+    # (Clang/ELF layouts can score low on x86 heuristics while still being valid)
+    if orig_match and len(exp_orig) > 0:
+        heur_ok, heur_score = True, CONFIDENCE_HEURISTIC_PATTERN
+    elif not heur_ok:
         messages.append("heuristic analysis uncertain")
     # Calculate aggregate confidence
     conf = calculate_confidence(True, ctx_ok, orig_match, fp_match, heur_score)
     ok = conf >= CONFIDENCE_THRESHOLD
     return ok, conf, messages
-
-
-def safe_patch(binary_data, offset, expected_original_bytes, patch_bytes, context_info=None,
-               known_fingerprints=None, apply_patch=True):
-    """Full patch flow: validate, optionally apply, verify.
-    binary_data must be bytearray if apply_patch=True.
-    context_info: dict with optional expected_prefix, expected_suffix, patch_name.
-    Returns (success, message)."""
-    ctx = context_info or {}
-    patch_name = ctx.get("patch_name", "")
-    exp_prefix = ctx.get("expected_prefix")
-    exp_suffix = ctx.get("expected_suffix")
-    ok, conf, messages = validate_patch_site(
-        binary_data, offset, expected_original_bytes, patch_bytes,
-        patch_name=patch_name, known_fingerprints=known_fingerprints,
-        expected_prefix=exp_prefix, expected_suffix=exp_suffix)
-    if not ok:
-        msg = "; ".join(messages) if messages else f"confidence {conf} < {CONFIDENCE_THRESHOLD}"
-        print(f"[warn] patch validation failed for {patch_name}: {msg}")
-        return False, msg
-    if not apply_patch:
-        print(f"[info] patch site validated for {patch_name} (confidence {conf})")
-        return True, f"validated (conf={conf})"
-    patch_b = patch_bytes if isinstance(patch_bytes, bytes) else bytes.fromhex(patch_bytes.replace(' ', ''))
-    exp_orig = expected_original_bytes if isinstance(expected_original_bytes, bytes) else bytes.fromhex(expected_original_bytes.replace(' ', ''))
-    current = bytes(binary_data[offset:offset + len(exp_orig)]) if len(exp_orig) > 0 else b''
-    if len(exp_orig) > 0 and current != exp_orig:
-        print(f"[warn] unexpected bytes at patch location, skipping")
-        return False, "pre-patch byte validation failed"
-    if not isinstance(binary_data, bytearray):
-        print(f"[warn] binary_data must be bytearray to apply patch")
-        return False, "invalid buffer type"
-    binary_data[offset:offset + len(patch_b)] = patch_b
-    verify = bytes(binary_data[offset:offset + len(patch_b)])
-    if verify != patch_b:
-        print(f"[error] patch verification failed")
-        return False, "post-patch verification failed"
-    print(f"[ok] patch applied successfully")
-    return True, "ok"
 
 
 def _run_patch_site_validation(data, file_offset, sig_or_dict, adj=0):
@@ -2406,6 +2392,28 @@ ALL_OFFSET_NAMES = [
 WINDOWS_PATCHER_OFFSET_NAMES = list(ALL_OFFSET_NAMES)
 
 PATCHER_OFFSET_NAMES = WINDOWS_PATCHER_OFFSET_NAMES
+
+# Single source of truth: only these names may appear in results (PE/ELF/Mach-O x86_64 and arm64).
+ALLOWED_OFFSET_NAMES = frozenset(ALL_OFFSET_NAMES)
+
+# Symbol maps must only reference the 17 patcher offsets (same set as Windows).
+for _map_name, _map in (("ELF_SYMBOL_MAP", ELF_SYMBOL_MAP), ("ARM64_SYMBOL_MAP", ARM64_SYMBOL_MAP)):
+    _extra = set(_map.keys()) - ALLOWED_OFFSET_NAMES
+    if _extra:
+        raise RuntimeError("%s has keys not in ALL_OFFSET_NAMES: %s" % (_map_name, sorted(_extra)))
+
+
+def _prune_results_to_allowed(results, tiers_used=None, label=""):
+    """Drop any key not in ALLOWED_OFFSET_NAMES so all OS paths expose only the 17 patcher offsets."""
+    if not results:
+        return
+    removed = [k for k in list(results.keys()) if k not in ALLOWED_OFFSET_NAMES]
+    for k in removed:
+        results.pop(k, None)
+        if tiers_used is not None:
+            tiers_used.pop(k, None)
+    if removed and label:
+        print(f"  [INFO] Pruned non-patcher offset(s) from {label}: {', '.join(removed)}")
 
 
 def _sliding_window_recover(data, anchor_config, delta, name, adj, bin_fmt='pe'):
@@ -2796,6 +2804,8 @@ def discover_offsets_arm64(data, arm64_info):
         for name in missing:
             errors.append((name, "no arm64 match"))
 
+    _prune_results_to_allowed(results, tiers_used, label="arm64")
+
     return results, errors, adj, tiers_used
 
 
@@ -3163,6 +3173,9 @@ def discover_offsets(data, bin_info):
         print(f"  [INVALID] {name}: {reason}")
 
     errors = [(n, e) for n, e in errors if n not in results]
+
+    _prune_results_to_allowed(results, tiers_used, label=fmt)
+
     return results, errors, adj, tiers_used
 
 
@@ -3180,7 +3193,7 @@ EXPECTED_ORIGINALS = {
     "CreateAudioFrameStereo":   (None, 4),
     "AudioEncoderOpusConfigSetChannels": ("01", 1),
     "AudioEncoderOpusConfigIsOk": ("8B 11 31 C0", 4),
-    "MonoDownmixer":            ("84 C0 74 0D", 4),
+    "MonoDownmixer":            ("84 C0", 2),
     "ThrowError":               ("41", 1),
     "DownmixFunc":              ("41", 1),
     "HighpassCutoffFilter":     (None, 0x100),
@@ -3355,6 +3368,13 @@ def check_injection_sites(data, results, adj):
 # endregion Validation
 
 
+def _md5_file_hex(file_path, lower=False):
+    """MD5 of file at path; always use context manager (no leaked handles)."""
+    with open(file_path, "rb") as f:
+        h = hashlib.md5(f.read()).hexdigest()
+    return h.lower() if lower else h
+
+
 # region Output Formatters
 # Output blocks are copy-paste compatible with:
 # - Windows: Discord_voice_node_patcher.ps1 (# region Offsets ... # endregion; order = $Script:RequiredOffsetNames)
@@ -3368,7 +3388,7 @@ def format_powershell_config(results, bin_info=None, file_path=None, file_size=N
     adj = (bin_info or {}).get('file_offset_adjustment', 0)
 
     if bin_info and file_path and file_size:
-        md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest()
+        md5 = _md5_file_hex(file_path)
         build_str = ''
         if fmt == 'pe' and 'build_time' in bin_info:
             build_str = bin_info['build_time'].strftime('%b %d %Y')
@@ -3542,7 +3562,7 @@ def format_linux_patcher_block(results, bin_info, file_path, file_size):
     if fmt != 'elf':
         return None
     adj = bin_info.get('file_offset_adjustment', 0)
-    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
+    md5 = _md5_file_hex(file_path, lower=True)
     lines = [
         "# --- Build fingerprint (update when targeting a new Discord build) ------------",
         "# Run: python discord_voice_node_offset_finder_v5.py <path/to/discord_voice.node>",
@@ -3573,7 +3593,7 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size):
         return None
     adj = bin_info.get('file_offset_adjustment', 0)
     fat_offset = bin_info.get('fat_offset', 0)
-    md5 = hashlib.md5(open(file_path, 'rb').read()).hexdigest().lower()
+    md5 = _md5_file_hex(file_path, lower=True)
     lines = [
         "# macOS/Clang offsets - Auto-generated by discord_voice_node_offset_finder.py v" + VERSION,
         f"# Build: MACHO binary | Size: {file_size} | MD5: {md5}",
@@ -3597,18 +3617,20 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size):
 def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
     """Generate machine-readable JSON output."""
     fmt = bin_info.get('format', 'raw') if bin_info else 'pe'
+    # Only emit the 17 patcher-aligned offsets (same set as Windows)
+    offsets_only = {name: off for name, off in results.items() if name in ALLOWED_OFFSET_NAMES}
     out = {
         "tool": "discord_voice_node_offset_finder",
         "version": VERSION,
         "file": str(file_path),
         "file_size": file_size,
-        "md5": hashlib.md5(open(file_path, 'rb').read()).hexdigest(),
+        "md5": _md5_file_hex(file_path),
         "format": fmt,
         "arch": bin_info.get('arch', 'unknown') if bin_info else 'unknown',
         "file_offset_adjustment": hex(adj),
-        "offsets": {name: hex(off) for name, off in sorted(results.items())},
-        "resolution_tiers": tiers_used,
-        "total_found": len(results),
+        "offsets": {name: hex(off) for name, off in sorted(offsets_only.items())},
+        "resolution_tiers": {k: v for k, v in (tiers_used or {}).items() if k in ALLOWED_OFFSET_NAMES},
+        "total_found": len(offsets_only),
         "total_expected": len(ALL_OFFSET_NAMES),
     }
 
@@ -3620,7 +3642,7 @@ def format_json(results, bin_info, file_path, file_size, adj, tiers_used):
         out["image_base"] = hex(bin_info.get('image_base', 0))
         out["has_symbols"] = bin_info.get('has_symbols', False)
         # Include file offsets for direct patching
-        out["file_offsets"] = {name: hex(off - adj) for name, off in sorted(results.items())}
+        out["file_offsets"] = {name: hex(off - adj) for name, off in sorted(offsets_only.items())}
 
     # macOS stereo mic patches (when applicable)
     if bin_info and fmt == 'macho' and 'stereo_patches' in bin_info:

@@ -4,6 +4,9 @@ Discord Voice Node Offset Finder - GUI
 Auto-detects and loads the offset finder script from the same directory.
 Matches the Stereo Installer dark theme.
 
+Works with finder v5.1+: 17 offsets (same set as Windows/Linux/macOS patchers).
+Copy Block copies the Windows paste block for PE, or Linux/macOS block when applicable.
+
 Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher
 """
 
@@ -21,9 +24,8 @@ import io
 
 sys.dont_write_bytecode = True
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCRIPT_DIR = Path(__file__).parent
-TARGET_BITRATE_KBPS = 384
 
 
 def _cleanup_pycache():
@@ -54,6 +56,15 @@ CYAN         = "#4dd0e1"
 SELECT_BG    = "#0d47a1"
 
 
+def _ascii_safe(s):
+    """Patcher blocks and console copy should be ASCII-only; replace non-ASCII for clipboard."""
+    if not s:
+        return ""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", errors="replace")
+    return s.encode("ascii", errors="replace").decode("ascii")
+
+
 class OffsetFinderGUI:
     def __init__(self, root):
         self.root = root
@@ -75,6 +86,8 @@ class OffsetFinderGUI:
         self.status_var = tk.StringVar(value="Ready")
         self.last_output = ""
         self.last_windows_block = ""
+        self.last_linux_block = ""
+        self.last_macos_block = ""
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -266,6 +279,8 @@ class OffsetFinderGUI:
         self.output.configure(state="disabled")
         self.last_output = ""
         self.last_windows_block = ""
+        self.last_linux_block = ""
+        self.last_macos_block = ""
 
     def _copy_output(self):
         text = self.last_output.strip()
@@ -273,16 +288,17 @@ class OffsetFinderGUI:
             text = self.output.get("1.0", "end").strip()
         if text:
             self.root.clipboard_clear()
-            self.root.clipboard_append(text.encode("ascii", "replace").decode("ascii"))
+            self.root.clipboard_append(_ascii_safe(text))
             self.status_var.set("Output copied to clipboard")
 
     def _copy_block(self):
-        block = self.last_windows_block.strip()
+        # Prefer Windows block; else Linux; else macOS (same 17 offsets for all patchers)
+        block = (self.last_windows_block or self.last_linux_block or self.last_macos_block or "").strip()
         if not block:
-            self.status_var.set("No Windows block to copy (run Find Offsets first)")
+            self.status_var.set("No patcher block to copy (run Find Offsets first)")
             return
         self.root.clipboard_clear()
-        self.root.clipboard_append(block.encode("ascii", "replace").decode("ascii"))
+        self.root.clipboard_append(_ascii_safe(block))
         self.status_var.set("Block copied (paste into patcher)")
 
     def _save_results(self):
@@ -297,7 +313,8 @@ class OffsetFinderGUI:
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if path:
-            with open(path, "w", encoding="utf-8") as f:
+            # UTF-8 with BOM optional; use utf-8 for paths/names that may contain unicode
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             self.status_var.set(f"Saved to {path}")
 
@@ -412,6 +429,8 @@ class OffsetFinderGUI:
             is_pe = fmt == "pe"
             patcher_count = sum(1 for k in patcher_names if k in results) if (is_pe and patcher_names) else found
             n_patcher = len(patcher_names) if patcher_names else 17
+            # Expected x86_64 offset count for summary (Linux/macOS/ELF use same 17 as patcher set)
+            n_expected = n_patcher
 
             self._append_output_safe(f"\n  {'=' * 55}\n", "header")
             self._append_output_safe("  RESULTS SUMMARY\n", "header")
@@ -428,12 +447,12 @@ class OffsetFinderGUI:
                     self._append_output_safe(
                         f"  Windows patcher: {patcher_count}/{n_patcher} ({n_patcher - patcher_count} missing)\n", "warn")
             else:
-                if found == total:
+                if found == n_expected:
                     self._append_output_safe(
-                        f"  [OK] ALL {found} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
+                        f"  [OK] ALL {found}/{n_expected} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
                 else:
                     self._append_output_safe(
-                        f"  x86_64: Found {found}/{total} offsets ({total - found} missing)\n", "warn")
+                        f"  x86_64: Found {found}/{n_expected} offsets ({n_expected - found} missing)\n", "warn")
             if errors:
                 for e in errors:
                     if isinstance(e, (list, tuple)) and len(e) >= 2:
@@ -479,12 +498,11 @@ class OffsetFinderGUI:
                         tag = "header"
                     self._append_output_safe(line + "\n", tag)
 
-                self._append_output_safe(f"\n  arm64: {arm64_found}/{total} offsets found\n",
-                                         "success" if arm64_found == total else "warn")
+                self._append_output_safe(f"\n  arm64: {arm64_found}/{n_expected} offsets found\n",
+                                         "success" if arm64_found == n_expected else "warn")
 
             file_size = len(data)
 
-            encoder_config_init3_rva = None
             if fmt == "pe" and hasattr(mod, "run_bitrate_audit_pe"):
                 ts = bin_info.get("text_section")
                 t_start = ts["raw_offset"] if ts else 0
@@ -493,7 +511,7 @@ class OffsetFinderGUI:
                 audit_out = io.StringIO()
                 sys.stdout = audit_out
                 try:
-                    encoder_config_init3_rva = mod.run_bitrate_audit_pe(data, results, adj, t_start, t_end)
+                    mod.run_bitrate_audit_pe(data, results, adj, t_start, t_end)
                 finally:
                     sys.stdout = old_stdout
                 for line in audit_out.getvalue().splitlines():
@@ -501,9 +519,12 @@ class OffsetFinderGUI:
                     self._append_output_safe(line + "\n", tag)
 
             if fmt == "pe" and hasattr(mod, "format_windows_patcher_block"):
-                block = mod.format_windows_patcher_block(results, bin_info, path, file_size, optional_encoder_config_init3=encoder_config_init3_rva)
+                # Finder v5.1+: 17 offsets; signature is (results, bin_info, path, file_size)
+                block = mod.format_windows_patcher_block(results, bin_info, path, file_size)
                 if block:
-                    self.last_windows_block = block.encode("ascii", "replace").decode("ascii")
+                    self.last_windows_block = _ascii_safe(block)
+                    self.last_linux_block = ""
+                    self.last_macos_block = ""
                 else:
                     self.last_windows_block = ""
                 if block:
@@ -542,6 +563,7 @@ class OffsetFinderGUI:
             if fmt == "elf" and hasattr(mod, "format_linux_patcher_block"):
                 block = mod.format_linux_patcher_block(results, bin_info, path, file_size)
                 if block:
+                    self.last_linux_block = _ascii_safe(block)
                     self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
                     self._append_output_safe("  COPY BELOW -> discord_voice_patcher_linux.sh\n", "header")
                     self._append_output_safe("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section\n", "info")
@@ -549,9 +571,14 @@ class OffsetFinderGUI:
                     self._append_output_safe("--- BEGIN COPY (Linux) ---\n", None)
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
+                else:
+                    self.last_linux_block = ""
             elif fmt == "macho" and hasattr(mod, "format_macos_patcher_block"):
                 block = mod.format_macos_patcher_block(results, bin_info, path, file_size)
                 if block:
+                    self.last_macos_block = _ascii_safe(block)
+                    self.last_windows_block = ""
+                    self.last_linux_block = ""
                     self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
                     self._append_output_safe("  COPY BELOW -> discord_voice_patcher_macos.sh\n", "header")
                     self._append_output_safe("  Replace the declare -A OFFSETS and comment block (x86_64)\n", "info")
@@ -559,6 +586,8 @@ class OffsetFinderGUI:
                     self._append_output_safe("--- BEGIN COPY (macOS) ---\n", None)
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
+                else:
+                    self.last_macos_block = ""
 
             if self.save_json.get():
                 try:
@@ -570,11 +599,11 @@ class OffsetFinderGUI:
                     self._append_output_safe(f"\n  JSON save error: {e}\n", "warn")
 
             if is_pe and patcher_names:
-                status_msg = f"Done - Windows patcher: {patcher_count}/{n_patcher} | x86_64: {found}/18"
+                status_msg = f"Done - Windows patcher: {patcher_count}/{n_patcher} | x86_64: {found}/{n_expected}"
             else:
-                status_msg = f"Done - x86_64: {found}/{total}"
+                status_msg = f"Done - x86_64: {found}/{n_expected}"
             if arm64_found > 0:
-                status_msg += f" | arm64: {arm64_found}/{total}"
+                status_msg += f" | arm64: {arm64_found}/{n_expected}"
             status_msg += f" | {datetime.now().strftime('%H:%M:%S')}"
             self._set_status_safe(status_msg)
 
