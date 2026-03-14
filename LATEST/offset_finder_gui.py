@@ -26,6 +26,8 @@ sys.dont_write_bytecode = True
 
 VERSION = "1.1.0"
 SCRIPT_DIR = Path(__file__).parent
+# Windows debug: no bash needed; finder runs natively on PE. Set OFFSET_FINDER_DEBUG=1 for verbose log.
+DEBUG_MODE = os.environ.get("OFFSET_FINDER_DEBUG", "").lower() in ("1", "true", "yes") or "--debug" in sys.argv
 
 
 def _cleanup_pycache():
@@ -68,7 +70,7 @@ def _ascii_safe(s):
 class OffsetFinderGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Offset Finder")
+        self.root.title("Offset Finder" + (" [DEBUG]" if DEBUG_MODE else ""))
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(620, 640)
@@ -383,45 +385,45 @@ class OffsetFinderGUI:
             bin_info = mod.detect_binary_format(data)
             fmt = bin_info.get("format", "unknown")
             arch = bin_info.get("arch", "unknown")
+            verbose = self.verbose.get()
 
-            self._append_output_safe(f"  Format: {fmt.upper()} | Arch: {arch}\n", "info")
-
-            if bin_info.get("has_symbols"):
-                nsyms = len(bin_info.get("func_symbols", {}))
-                self._append_output_safe(f"  x86_64 Symbols: {nsyms} functions found\n", "info")
-
-            if bin_info.get("arm64_info"):
-                a64 = bin_info["arm64_info"]
-                n_a64 = len(a64.get("func_symbols", {}))
-                self._append_output_safe(
-                    f"  arm64 slice: {a64.get('fat_size', 0):,} bytes | "
-                    f"{n_a64} symbols\n", "info")
-
-            self._append_output_safe("\n  Scanning for offsets...\n\n", "header")
+            if verbose:
+                self._append_output_safe(f"  Format: {fmt.upper()} | Arch: {arch}\n", "info")
+                if bin_info.get("has_symbols"):
+                    nsyms = len(bin_info.get("func_symbols", {}))
+                    self._append_output_safe(f"  x86_64 Symbols: {nsyms} functions found\n", "info")
+                if bin_info.get("arm64_info"):
+                    a64 = bin_info["arm64_info"]
+                    n_a64 = len(a64.get("func_symbols", {}))
+                    self._append_output_safe(
+                        f"  arm64 slice: {a64.get('fat_size', 0):,} bytes | "
+                        f"{n_a64} symbols\n", "info")
+                self._append_output_safe("\n  Scanning for offsets...\n\n", "header")
 
             old_stdout = sys.stdout
             capture = io.StringIO()
             sys.stdout = capture
 
             try:
-                results, errors, adj, tiers_used = mod.discover_offsets(data, bin_info)
+                results, errors, adj, tiers_used = mod.discover_offsets(data, bin_info, verbose=verbose)
             finally:
                 sys.stdout = old_stdout
 
             captured = capture.getvalue()
-            for line in captured.splitlines():
-                tag = None
-                if "[PASS]" in line:
-                    tag = "pass"
-                elif "[FAIL]" in line:
-                    tag = "fail"
-                elif "[WARN]" in line:
-                    tag = "warn"
-                elif "[INFO]" in line or "[SKIP]" in line or "[HEUR]" in line:
-                    tag = "info"
-                elif line.strip().startswith("PHASE") or line.strip().startswith("==="):
-                    tag = "header"
-                self._append_output_safe(line + "\n", tag)
+            if verbose:
+                for line in captured.splitlines():
+                    tag = None
+                    if "[PASS]" in line:
+                        tag = "pass"
+                    elif "[FAIL]" in line:
+                        tag = "fail"
+                    elif "[WARN]" in line:
+                        tag = "warn"
+                    elif "[INFO]" in line or "[SKIP]" in line or "[HEUR]" in line:
+                        tag = "info"
+                    elif line.strip().startswith("PHASE") or line.strip().startswith("==="):
+                        tag = "header"
+                    self._append_output_safe(line + "\n", tag)
 
             total = 18
             found = len(results)
@@ -429,53 +431,54 @@ class OffsetFinderGUI:
             is_pe = fmt == "pe"
             patcher_count = sum(1 for k in patcher_names if k in results) if (is_pe and patcher_names) else found
             n_patcher = len(patcher_names) if patcher_names else 17
-            # Expected x86_64 offset count for summary (Linux/macOS/ELF use same 17 as patcher set)
             n_expected = n_patcher
-
-            self._append_output_safe(f"\n  {'=' * 55}\n", "header")
-            self._append_output_safe("  RESULTS SUMMARY\n", "header")
-            self._append_output_safe(f"  {'=' * 55}\n", "header")
-            if is_pe and patcher_names:
-                self._append_output_safe(
-                    f"  Windows patcher:   {patcher_count} / {n_patcher}  (required for Discord_voice_node_patcher.ps1)\n", "info")
-                self._append_output_safe(
-                    f"  x86_64 discovered: {found} offsets\n", "info")
-                if patcher_count == n_patcher:
-                    self._append_output_safe(
-                        f"  [OK] ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND\n", "success")
-                else:
-                    self._append_output_safe(
-                        f"  Windows patcher: {patcher_count}/{n_patcher} ({n_patcher - patcher_count} missing)\n", "warn")
-            else:
-                if found == n_expected:
-                    self._append_output_safe(
-                        f"  [OK] ALL {found}/{n_expected} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
-                else:
-                    self._append_output_safe(
-                        f"  x86_64: Found {found}/{n_expected} offsets ({n_expected - found} missing)\n", "warn")
-            if errors:
-                for e in errors:
-                    if isinstance(e, (list, tuple)) and len(e) >= 2:
-                        self._append_output_safe(f"  Missing: {e[0]}: {e[1]}\n", "fail")
-                    else:
-                        self._append_output_safe(f"  Missing: {e}\n", "fail")
 
             try:
                 xval = mod._cross_validate(results, adj, data, tiers_used=tiers_used)
+            except Exception:
+                xval = []
+
+            if verbose:
+                self._append_output_safe(f"\n  {'=' * 55}\n", "header")
+                self._append_output_safe("  RESULTS SUMMARY\n", "header")
+                self._append_output_safe(f"  {'=' * 55}\n", "header")
+                if is_pe and patcher_names:
+                    self._append_output_safe(
+                        f"  Windows patcher:   {patcher_count} / {n_patcher}  (required for Discord_voice_node_patcher.ps1)\n", "info")
+                    self._append_output_safe(
+                        f"  x86_64 discovered: {found} offsets\n", "info")
+                    if patcher_count == n_patcher:
+                        self._append_output_safe(
+                            f"  [OK] ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND\n", "success")
+                    else:
+                        self._append_output_safe(
+                            f"  Windows patcher: {patcher_count}/{n_patcher} ({n_patcher - patcher_count} missing)\n", "warn")
+                else:
+                    if found == n_expected:
+                        self._append_output_safe(
+                            f"  [OK] ALL {found}/{n_expected} x86_64 OFFSETS FOUND SUCCESSFULLY\n", "success")
+                    else:
+                        self._append_output_safe(
+                            f"  x86_64: Found {found}/{n_expected} offsets ({n_expected - found} missing)\n", "warn")
+                if errors:
+                    for e in errors:
+                        if isinstance(e, (list, tuple)) and len(e) >= 2:
+                            self._append_output_safe(f"  Missing: {e[0]}: {e[1]}\n", "fail")
+                        else:
+                            self._append_output_safe(f"  Missing: {e}\n", "fail")
                 if xval:
                     for w in xval:
                         self._append_output_safe(f"  [XVAL] {w}\n", "warn")
                 else:
                     self._append_output_safe("  Cross-validation: clean\n", "pass")
-            except Exception:
-                pass
 
             arm64_found = 0
             arm64_info = bin_info.get("arm64_info")
             if arm64_info and hasattr(mod, "discover_offsets_arm64"):
-                self._append_output_safe(f"\n  {'=' * 55}\n", "header")
-                self._append_output_safe(f"  ARM64 Offset Discovery (Apple Silicon)\n", "header")
-                self._append_output_safe(f"  {'=' * 55}\n", "header")
+                if verbose:
+                    self._append_output_safe(f"\n  {'=' * 55}\n", "header")
+                    self._append_output_safe(f"  ARM64 Offset Discovery (Apple Silicon)\n", "header")
+                    self._append_output_safe(f"  {'=' * 55}\n", "header")
 
                 old_stdout = sys.stdout
                 arm64_capture = io.StringIO()
@@ -487,23 +490,23 @@ class OffsetFinderGUI:
                     sys.stdout = old_stdout
 
                 arm64_found = len(arm64_results)
-                arm64_out = arm64_capture.getvalue()
-                for line in arm64_out.splitlines():
-                    tag = None
-                    if "[SYM ]" in line or "[SCAN]" in line:
-                        tag = "pass"
-                    elif "[HINT]" in line or "missing" in line.lower():
-                        tag = "warn"
-                    elif "====" in line or "PHASE" in line:
-                        tag = "header"
-                    self._append_output_safe(line + "\n", tag)
-
-                self._append_output_safe(f"\n  arm64: {arm64_found}/{n_expected} offsets found\n",
-                                         "success" if arm64_found == n_expected else "warn")
+                if verbose:
+                    arm64_out = arm64_capture.getvalue()
+                    for line in arm64_out.splitlines():
+                        tag = None
+                        if "[SYM ]" in line or "[SCAN]" in line:
+                            tag = "pass"
+                        elif "[HINT]" in line or "missing" in line.lower():
+                            tag = "warn"
+                        elif "====" in line or "PHASE" in line:
+                            tag = "header"
+                        self._append_output_safe(line + "\n", tag)
+                    self._append_output_safe(f"\n  arm64: {arm64_found}/{n_expected} offsets found\n",
+                                             "success" if arm64_found == n_expected else "warn")
 
             file_size = len(data)
 
-            if fmt == "pe" and hasattr(mod, "run_bitrate_audit_pe"):
+            if verbose and fmt == "pe" and hasattr(mod, "run_bitrate_audit_pe"):
                 ts = bin_info.get("text_section")
                 t_start = ts["raw_offset"] if ts else 0
                 t_end = (ts["raw_offset"] + ts["raw_size"]) if ts else len(data)
@@ -518,6 +521,15 @@ class OffsetFinderGUI:
                     tag = "header" if "====" in line or "BITRATE" in line else ("warn" if "uncovered" in line else None)
                     self._append_output_safe(line + "\n", tag)
 
+            if not verbose and is_pe:
+                self._append_output_safe(f"  {patcher_count} / 17  (required for Discord_voice_node_patcher.ps1)\n", "info")
+                self._append_output_safe(f"  x86_64 discovered: {found} offsets\n", "info")
+                if patcher_count == 17:
+                    self._append_output_safe("  [OK] ALL 17 WINDOWS PATCHER OFFSETS FOUND\n", "success")
+                else:
+                    self._append_output_safe(f"  *** PARTIAL: {patcher_count}/17 ***\n", "warn")
+                self._append_output_safe("  Cross-validation: clean\n" if not xval else f"  Cross-validation: {len(xval)} issue(s)\n", "pass" if not xval else "warn")
+
             if fmt == "pe" and hasattr(mod, "format_windows_patcher_block"):
                 # Finder v5.1+: 17 offsets; signature is (results, bin_info, path, file_size)
                 block = mod.format_windows_patcher_block(results, bin_info, path, file_size)
@@ -528,19 +540,20 @@ class OffsetFinderGUI:
                 else:
                     self.last_windows_block = ""
                 if block:
-                    self._append_output_safe("\n", None)
-                    self._append_output_safe("  " + "=" * 55 + "\n", "header")
-                    self._append_output_safe("  COPY BELOW -> Discord_voice_node_patcher.ps1\n", "header")
-                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    if verbose:
+                        self._append_output_safe("\n", None)
+                        self._append_output_safe("  " + "=" * 55 + "\n", "header")
+                        self._append_output_safe("  COPY BELOW -> Discord_voice_node_patcher.ps1\n", "header")
+                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
                     self._append_output_safe("--- BEGIN COPY (Windows) ---\n", None)
                     self._append_output_safe(block if block.endswith("\n") else block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
-                    if hasattr(mod, "format_windows_debug_mode"):
+                    if verbose and hasattr(mod, "format_windows_debug_mode"):
                         self._append_output_safe("  DEBUG MODE (patch names)\n", "header")
                         self._append_output_safe("  " + "-" * 55 + "\n", "header")
                         self._append_output_safe(mod.format_windows_debug_mode(results) + "\n\n", None)
 
-            if fmt != "pe":
+            if verbose and fmt != "pe":
                 self._append_output_safe("\n", None)
                 ps_text = None
                 old_stdout = sys.stdout
@@ -564,10 +577,11 @@ class OffsetFinderGUI:
                 block = mod.format_linux_patcher_block(results, bin_info, path, file_size)
                 if block:
                     self.last_linux_block = _ascii_safe(block)
-                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
-                    self._append_output_safe("  COPY BELOW -> discord_voice_patcher_linux.sh\n", "header")
-                    self._append_output_safe("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section\n", "info")
-                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    if verbose:
+                        self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                        self._append_output_safe("  COPY BELOW -> discord_voice_patcher_linux.sh\n", "header")
+                        self._append_output_safe("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section\n", "info")
+                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
                     self._append_output_safe("--- BEGIN COPY (Linux) ---\n", None)
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
@@ -579,10 +593,11 @@ class OffsetFinderGUI:
                     self.last_macos_block = _ascii_safe(block)
                     self.last_windows_block = ""
                     self.last_linux_block = ""
-                    self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
-                    self._append_output_safe("  COPY BELOW -> discord_voice_patcher_macos.sh\n", "header")
-                    self._append_output_safe("  Replace the declare -A OFFSETS and comment block (x86_64)\n", "info")
-                    self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    if verbose:
+                        self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
+                        self._append_output_safe("  COPY BELOW -> discord_voice_patcher_macos.sh\n", "header")
+                        self._append_output_safe("  Replace the declare -A OFFSETS and comment block (x86_64)\n", "info")
+                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
                     self._append_output_safe("--- BEGIN COPY (macOS) ---\n", None)
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)

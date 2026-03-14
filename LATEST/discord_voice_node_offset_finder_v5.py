@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""
-Discord Voice Node Offset Finder v5.1
-Cross-platform offset discovery for discord_voice.node (PE/ELF/Mach-O).
-Windows/Linux/macOS: 17 offsets (same set for all patchers).
-Includes confidence scoring, heuristic analysis, and patch site validation.
-Usage: python discord_voice_node_offset_finder_v5.py [path_to_discord_voice.node]
-"""
+"""Discord Voice Node Offset Finder v5.1 — PE/ELF/Mach-O offset discovery (17 patcher offsets)."""
 
 import sys
 import os
+import io
 import atexit
 import struct
 import json
@@ -68,6 +63,8 @@ SLIDING_WINDOW_DEFAULT = 128
 SLIDING_WINDOW_OVERRIDES = {
     "EmulateStereoSuccess2": 48,
     "EncoderConfigInit1": 48,
+    # macOS/Clang: delta from anchor can be larger; search ±1KB for "00 7D 00"
+    "EmulateBitrateModified": 0x1000,
 }
 
 class Signature:
@@ -98,6 +95,10 @@ class Signature:
 
 
 def _mono_downmixer_disambiguator(data, match_offset):
+    # Audit 2b: reject if already NOP-patched (84 C0 74 0D -> 90...)
+    if match_offset + 8 + 13 <= len(data):
+        if data[match_offset + 8:match_offset + 8 + 13] == b'\x90' * 13:
+            return False
     jg_pos = match_offset + 19
     if jg_pos + 6 > len(data):
         return False
@@ -105,6 +106,39 @@ def _mono_downmixer_disambiguator(data, match_offset):
         return True
     if b'\x44\x0f\xb6' in data[jg_pos + 6 : jg_pos + 70]:
         return True
+    return False
+
+
+def _ess1_no_duplicate_cmp_in_next_24(data, match_offset):
+    """Audit: stronger anchor — reject if a second cmp byte [rsp+disp], 1 appears in next 24 bytes."""
+    if match_offset + 18 + 24 > len(data):
+        return True
+    chunk = data[match_offset + 18 : match_offset + 18 + 24]
+    # Second occurrence of 80 BC 24 xx xx 00 00 01 (at least 8 bytes)
+    pos = 0
+    while pos <= len(chunk) - 8:
+        if chunk[pos:pos+3] == b'\x80\xBC\x24' and chunk[pos+7] == 0x01:
+            return False
+        pos += 1
+    return True
+
+
+def has_nearby_stereo_setter(data, file_offset, window=120):
+    """Check for stereo setter (mov byte [rsp+disp], 0/1/2) near match.
+    Pattern: C6 84 24 <disp32> <imm8> with 0x140 <= disp <= 0x1C0 and imm in (0,1,2).
+    Used to disambiguate EmulateStereoSuccess1 when multiple primary matches exist.
+    """
+    if not isinstance(data, (bytes, bytearray)) or file_offset < 0:
+        return False
+    start = max(0, file_offset - window)
+    end = min(len(data) - 8, file_offset + window)
+    for pos in range(start, end):
+        if data[pos:pos + 3] != b'\xC6\x84\x24':
+            continue
+        disp = struct.unpack_from('<I', data, pos + 3)[0]
+        imm = data[pos + 7]
+        if imm in (0, 1, 2) and 0x140 <= disp <= 0x1C0:
+            return True
     return False
 
 
@@ -274,7 +308,7 @@ CLANG_ALT_PATTERNS = [
 ]
 
 def parse_pe(data):
-    """Extract PE info and compute file offset adjustment dynamically from .text section."""
+    """Extract PE info; file_offset_adjustment from .text VA - raw, else 0xC00."""
     if len(data) < 0x40 or data[:2] != b'MZ':
         return None
 
@@ -309,8 +343,6 @@ def parse_pe(data):
             'raw_size': raw_size, 'raw_offset': raw_offset
         })
 
-    # Dynamic adjustment: .text VA - .text raw offset
-    # Falls back to first executable section, then to hardcoded 0xC00
     file_offset_adjustment = None
     text_section = None
     for sec in sections:
@@ -327,7 +359,7 @@ def parse_pe(data):
                 break
 
     if file_offset_adjustment is None:
-        file_offset_adjustment = 0xC00  # hardcoded fallback
+        file_offset_adjustment = 0xC00
         text_section = sections[0] if sections else None
 
     build_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -346,9 +378,8 @@ def parse_pe(data):
 
 
 # region ELF Parser
-
-# Mapping from our offset names to likely ELF symbol substrings.
-# Linux builds ship with debug symbols - function names are present in .symtab/.dynsym.
+# Offset names -> ELF symbol substrings (Linux node not stripped)
+# client builds (Stable, PTB, Canary). Function names are in .symtab/.dynsym.
 # Each entry is a list of candidate symbol substrings (tried in order).
 # Entries with target_within=True mean the offset is INSIDE the function, not at its start.
 ELF_SYMBOL_MAP = {
@@ -559,8 +590,9 @@ ARM64_SYMBOL_MAP = {
 def parse_elf(data):
     """Parse ELF binary and extract section info, adjustment, and symbol table.
 
-    Linux discord_voice.node ships with debug symbols (not stripped), so we
-    can resolve function addresses directly from .symtab/.dynsym.
+    Linux discord_voice.node is not stripped: debug symbols are present for
+    every node in all three client builds (Stable, PTB, Canary). We resolve
+    function addresses directly from .symtab/.dynsym.
     """
     if len(data) < 64:
         return None
@@ -1080,10 +1112,7 @@ def find_macos_stereo_patches(data):
 # region Format Detection
 
 def detect_binary_format(data):
-    """Try PE -> Mach-O -> ELF -> raw scan fallback.
-    Returns a pe_info-compatible dict with 'format' key."""
-
-    # Try PE first (Windows)
+    """PE -> Mach-O -> ELF -> raw; returns dict with 'format', file_offset_adjustment, text_section."""
     pe = parse_pe(data)
     if pe:
         pe['format'] = 'pe'
@@ -1092,18 +1121,12 @@ def detect_binary_format(data):
         pe['func_symbols'] = {}
         pe['symbols'] = []
         return pe
-
-    # Try Mach-O (macOS)
     macho = parse_macho(data)
     if macho:
         return macho
-
-    # Try ELF (Linux)
     elf = parse_elf(data)
     if elf:
         return elf
-
-    # Fallback: raw scan with adj=0
     return {
         'format': 'raw',
         'image_base': 0,
@@ -1119,13 +1142,7 @@ def detect_binary_format(data):
 
 
 def _linux_scan_within_function(data, func_start, func_size, scan_type, adj):
-    """Scan within a known function range for a specific instruction pattern.
-
-    Each scan_type encodes the knowledge of what bytes to look for inside
-    a particular function on a Clang/Linux build.
-
-    Returns the CONFIG offset (file offset + adj) or None.
-    """
+    """Scan function range for scan_type pattern; returns config offset (file_off + adj) or None."""
     import struct as _st
 
     end = min(func_start + func_size, len(data))
@@ -1646,7 +1663,8 @@ def _arm64_scan_within_function(data, func_start, func_size, scan_type, adj):
 def _resolve_elf_symbols(bin_info, data):
     """Use ELF/Mach-O symbol table to resolve offsets directly.
 
-    For function-start offsets, the symbol address is the offset.
+    Linux nodes (Stable, PTB, Canary) are not stripped; symbols are always
+    present. For function-start offsets, the symbol address is the offset.
     For instruction-level offsets, we find the containing function then
     do a targeted instruction scan within that function's range.
 
@@ -1750,19 +1768,12 @@ def _resolve_elf_symbols(bin_info, data):
 # region Signature Scanner
 
 def scan_pattern(data, pattern, limit=0, start=0, end=None):
-    """Fast pattern scanner using bytes.find() for initial candidate skip.
-
-    Instead of checking every byte position (O(n*m) in Python), this finds
-    the first non-wildcard byte using C-speed bytes.find(), then verifies
-    the full pattern only at candidate positions.  ~100x faster than pure
-    Python loop on a 14MB binary.
-    """
+    """Pattern scan via bytes.find() for first fixed byte then verify; returns list of file offsets."""
     matches = []
     pat_len = len(pattern)
     if end is None:
         end = len(data)
 
-    # Find first non-wildcard byte for the fast skip
     first_fixed = None
     for i, b in enumerate(pattern):
         if b is not None:
@@ -1789,7 +1800,6 @@ def scan_pattern(data, pattern, limit=0, start=0, end=None):
         if candidate + pat_len > end:
             break
 
-        # Full pattern check at candidate
         match = True
         for j, p in enumerate(pattern):
             if p is not None and data[candidate + j] != p:
@@ -1823,15 +1833,29 @@ def find_offset(data, sig, text_start=0, text_end=None):
         if len(matches) == 1:
             file_offset = matches[0] + target_off
             if 0 <= file_offset < len(data):
+                if sig.name == "EmulateStereoSuccess1" and not has_nearby_stereo_setter(data, matches[0], 120):
+                    print(f"  [FILTER] EmulateStereoSuccess1 @ 0x{matches[0]:X} has no nearby stereo setter (accepting anyway)")
                 return file_offset, None, tier
 
-        # Multiple matches - resolve via disambiguator then byte validation
         resolved = list(matches)
-
         if sig.disambiguator and len(resolved) > 1:
             valid = [m for m in resolved if sig.disambiguator(data, m)]
             if len(valid) >= 1:
                 resolved = valid
+
+        if sig.name == "EmulateStereoSuccess1" and len(resolved) >= 1:
+            resolved = [m for m in resolved if _ess1_no_duplicate_cmp_in_next_24(data, m)]
+            if not resolved:
+                continue
+        if sig.name == "EmulateStereoSuccess1" and len(resolved) >= 1:
+            with_setter = [m for m in resolved if has_nearby_stereo_setter(data, m, 120)]
+            if len(resolved) > 1 and len(with_setter) >= 1:
+                for m in resolved:
+                    if m not in with_setter:
+                        print(f"  [FILTER] Rejected EmulateStereoSuccess1 @ 0x{m:X} — no nearby stereo setter")
+                resolved = with_setter
+            elif len(resolved) == 1 and not with_setter:
+                print(f"  [FILTER] EmulateStereoSuccess1 @ 0x{resolved[0]:X} has no nearby stereo setter (accepting anyway)")
 
         if len(resolved) > 1 and sig.expected_original:
             expected = bytes.fromhex(sig.expected_original.replace(' ', ''))
@@ -1845,7 +1869,6 @@ def find_offset(data, sig, text_start=0, text_end=None):
                 resolved = valid
 
         if len(resolved) > 1 and sig.patch_bytes and not sig.patch_bytes.startswith('<'):
-            # Also check if any match shows already-patched bytes (still valid)
             patched = bytes.fromhex(sig.patch_bytes.replace(' ', ''))
             valid = []
             for m in resolved:
@@ -1861,7 +1884,6 @@ def find_offset(data, sig, text_start=0, text_end=None):
             if 0 <= file_offset < len(data):
                 return file_offset, None, tier
         elif len(resolved) > 1:
-            # For relaxed tiers, accept first match with a warning flag
             if tier != "primary":
                 file_offset = resolved[0] + target_off
                 if 0 <= file_offset < len(data):
@@ -2342,9 +2364,7 @@ def _run_patch_site_validation(data, file_offset, sig_or_dict, adj=0):
 # region Offset Discovery Engine
 
 def _topo_sort_derivations(derivations):
-    """Sort derivation keys so parents resolve before children.
-
-    This ensures parent anchors resolve before derived offsets."""
+    """Sort derivation keys so parents resolve before children."""
     all_derived = set(derivations.keys())
     order = []
     visited = set()
@@ -2368,7 +2388,6 @@ def _all_offset_names():
     return list(ALL_OFFSET_NAMES)
 
 
-# Exactly 17 offsets (same set as Windows/Linux patchers). No BWE/Cwnd/DuplicateBitrate.
 ALL_OFFSET_NAMES = [
     "CreateAudioFrameStereo",
     "AudioEncoderOpusConfigSetChannels",
@@ -2393,18 +2412,33 @@ WINDOWS_PATCHER_OFFSET_NAMES = list(ALL_OFFSET_NAMES)
 
 PATCHER_OFFSET_NAMES = WINDOWS_PATCHER_OFFSET_NAMES
 
-# Single source of truth: only these names may appear in results (PE/ELF/Mach-O x86_64 and arm64).
 ALLOWED_OFFSET_NAMES = frozenset(ALL_OFFSET_NAMES)
-
-# Symbol maps must only reference the 17 patcher offsets (same set as Windows).
 for _map_name, _map in (("ELF_SYMBOL_MAP", ELF_SYMBOL_MAP), ("ARM64_SYMBOL_MAP", ARM64_SYMBOL_MAP)):
     _extra = set(_map.keys()) - ALLOWED_OFFSET_NAMES
     if _extra:
         raise RuntimeError("%s has keys not in ALL_OFFSET_NAMES: %s" % (_map_name, sorted(_extra)))
 
 
+def _log_context_fingerprints(data, results, adj, fmt):
+    """Log SHA1(32b before + 32b after) for top-5 critical patch sites."""
+    critical = [
+        "EmulateStereoSuccess1", "AudioEncoderOpusConfigSetChannels", "MonoDownmixer",
+        "SetsBitrateBitrateValue", "CreateAudioFrameStereo",
+    ]
+    for name in critical:
+        if name not in results:
+            continue
+        rva = results[name]
+        file_off = rva - adj
+        if file_off < 32 or file_off + 32 > len(data):
+            continue
+        region = data[file_off - 32:file_off + 32]
+        fp = hashlib.sha1(region).hexdigest()[:16]
+        print(f"  [CONTEXT FINGERPRINT] {name} @ 0x{rva:X}  sha1:{fp}...")
+
+
 def _prune_results_to_allowed(results, tiers_used=None, label=""):
-    """Drop any key not in ALLOWED_OFFSET_NAMES so all OS paths expose only the 17 patcher offsets."""
+    """Remove keys not in ALLOWED_OFFSET_NAMES."""
     if not results:
         return
     removed = [k for k in list(results.keys()) if k not in ALLOWED_OFFSET_NAMES]
@@ -2417,16 +2451,7 @@ def _prune_results_to_allowed(results, tiers_used=None, label=""):
 
 
 def _sliding_window_recover(data, anchor_config, delta, name, adj, bin_fmt='pe'):
-    """When exact derivation delta fails byte verification, scan nearby.
-
-    The compiler sometimes inserts or removes a few bytes between the anchor
-    and the target due to instruction scheduling or alignment changes.  This
-    scans +/-WINDOW bytes around the expected position looking for the known
-    original bytes at that offset.
-
-    Returns (config_offset, slide_distance) or (None, 0).
-    """
-    # Merge platform-specific expected bytes
+    """Scan ±WINDOW around expected position for original bytes; returns (config_offset, slide) or (None, 0)."""
     exp_map = _build_expected_map(bin_fmt)
 
     if name not in exp_map:
@@ -2451,7 +2476,24 @@ def _sliding_window_recover(data, anchor_config, delta, name, adj, bin_fmt='pe')
         if data[exact_file:exact_file + len(expected)] == expected:
             return anchor_config + delta, 0
 
-    # Scan window, preferring closer matches
+    # For single-byte expected, collect ALL positions in window; reject if ambiguous
+    if len(expected) == 1:
+        candidates = []
+        for dist in range(1, window + 1):
+            for direction in (+1, -1):
+                candidate = exact_file + (dist * direction)
+                if 0 <= candidate and candidate + 1 <= len(data):
+                    if data[candidate:candidate + 1] == expected:
+                        candidates.append((candidate, dist * direction))
+        if len(candidates) == 0:
+            return None, 0
+        if len(candidates) != 1:
+            print(f"  [SLIDING AMBIGUOUS] {name}: {len(candidates)} matches for expected byte in ±{window}, skipping")
+            return None, 0
+        candidate, slide_dist = candidates[0]
+        return candidate + adj, slide_dist
+
+    # Multi-byte expected: scan window, preferring closer matches
     for dist in range(1, window + 1):
         for direction in (+1, -1):
             candidate = exact_file + (dist * direction)
@@ -2463,15 +2505,30 @@ def _sliding_window_recover(data, anchor_config, delta, name, adj, bin_fmt='pe')
     return None, 0
 
 
+def _find_emulate_bitrate_in_anchor_window(data, anchor_file, adj, window=0x2000):
+    """Find 32000 literal (00 7D 00 00) near anchor; prefer imul; return (config_offset, reason) or (None, None)."""
+    literal_32000 = b'\x00\x7d\x00\x00'
+    start = max(0, anchor_file - window)
+    end = min(len(data) - 4, anchor_file + window)
+    candidates = []
+    pos = data.find(literal_32000, start, end + 1)
+    while pos >= 0:
+        if pos >= 2 and data[pos - 2] == 0x69:
+            candidates.append((pos, True))
+        elif pos >= 1 and 0xB8 <= data[pos - 1] <= 0xBF:
+            candidates.append((pos, False))
+        pos = data.find(literal_32000, pos + 1, end + 1)
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: (abs(x[0] - anchor_file), not x[1]))
+    file_off = candidates[0][0]
+    reason = "imul 32000" if candidates[0][1] else "mov 32000"
+    return file_off + adj, f"anchor-window({reason} @file:0x{file_off:X})"
+
+
 def _run_heuristic_scan(data, missing_names, adj, text_start, text_end):
-    """Last-resort structural search for missing offsets near known constants.
-
-    Searches for instruction patterns that are functionally tied to each offset,
-    even if the surrounding code has changed enough to break the primary signature.
-    """
+    """Last-resort search for missing offsets via instruction patterns."""
     hints = []
-
-    # --- Bitrate imul patterns: search for `imul reg, reg/rm, 0x7D00` (32000) ---
     if "EmulateBitrateModified" in missing_names:
         imul_pat = Signature._parse("69 ?? 00 7D 00 00")
         matches = scan_pattern(data, imul_pat, start=text_start, end=text_end)
@@ -2479,8 +2536,20 @@ def _run_heuristic_scan(data, missing_names, adj, text_start, text_end):
             candidate_file = m + 2
             reason = f"imul *,32000 @file:0x{m:X}"
             hints.append(("EmulateBitrateModified", candidate_file, reason))
-
-    # --- 48000/32000 constant pair for CreateAudioFrameStereo ---
+    if "Emulate48Khz" in missing_names:
+        for i in range(text_start, min(text_end, len(data) - 24)):
+            if data[i] == 0x83 and 0xB8 <= data[i+1] <= 0xBF and (data[i+1] & 7) != 4:
+                if i + 7 <= len(data) and data[i+6] == 0x02:
+                    for j in range(7, 20):
+                        if i + j + 2 <= len(data) and data[i+j] == 0x0F and 0x40 <= data[i+j+1] <= 0x4F:
+                            hints.append(("Emulate48Khz", i + j, f"cmp ...,2 + cmov @file:0x{i:X} [HEURISTIC USED]"))
+                            break
+            if data[i:i+2] == b'\x41\x83' and i + 8 <= len(data):
+                if 0xB8 <= data[i+2] <= 0xBF and (data[i+2] & 7) != 4 and data[i+7] == 0x02:
+                    for j in range(8, 24):
+                        if i + j + 2 <= len(data) and data[i+j] == 0x0F and 0x40 <= data[i+j+1] <= 0x4F:
+                            hints.append(("Emulate48Khz", i + j, f"41 83 cmp ...,2 + cmov @file:0x{i:X} [HEURISTIC USED]"))
+                            break
     if "CreateAudioFrameStereo" in missing_names:
         pair_pat = Signature._parse("B8 80 BB 00 00 BD 00 7D 00 00")
         matches = scan_pattern(data, pair_pat, start=text_start, end=text_end, limit=5)
@@ -2491,8 +2560,6 @@ def _run_heuristic_scan(data, missing_names, adj, text_start, text_end):
                 if pos + 4 <= len(data) and data[pos:pos+4] == b'\x4C\x0F\x43\xE8':
                     hints.append(("CreateAudioFrameStereo", pos, f"48k/32k pair + cmovae @file:0x{m:X}"))
                     break
-
-    # --- Opus packed config constant {48000<<32 | 20} = 0xBB80_0000_0014 ---
     if "AudioEncoderOpusConfigSetChannels" in missing_names:
         bb80_pat = Signature._parse("48 B9 14 00 00 00 80 BB 00 00")
         matches = scan_pattern(data, bb80_pat, start=text_start, end=text_end, limit=5)
@@ -2636,8 +2703,9 @@ def run_bitrate_audit_pe(data, results, adj, text_start, text_end):
             print(f"    uncovered  file 0x{f:X}  RVA 0x{rva:X}")
         if len(uncovered_512k) > 10:
             print(f"    ... and {len(uncovered_512k) - 10} more")
-        print("  If Discord still reports ~512/529 Kbps, add EncoderConfigInit3 in the patcher:")
         rva0 = uncovered_512k[0][1]
+        print(f"  [NEW DISCOVERY VERIFIED] potential EncoderConfigInit3 (uncovered 512000 literal) at RVA 0x{rva0:X}")
+        print("  If Discord still reports ~512/529 Kbps, add EncoderConfigInit3 in the patcher:")
         print(f"  In Offsets set:  EncoderConfigInit3 = 0x{rva0:X}")
     if not uncovered_32k and not uncovered_512k and bitrate_rvas:
         print("  All 32000/512000 constants in .text are at or near known patch sites.")
@@ -2809,10 +2877,21 @@ def discover_offsets_arm64(data, arm64_info):
     return results, errors, adj, tiers_used
 
 
-def discover_offsets(data, bin_info):
-    """Run full offset discovery pipeline with tiered fallback.
-    Accepts unified bin_info dict (from detect_binary_format).
-    Returns (results_dict, errors_list, adjustment, tiers_used_dict)."""
+def discover_offsets(data, bin_info, verbose=True):
+    """Full discovery pipeline; verbose=False suppresses phase prints. Returns (results, errors, adj, tiers_used)."""
+    _saved_stdout = None
+    if not verbose:
+        _saved_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+    try:
+        return _discover_offsets_impl(data, bin_info)
+    finally:
+        if _saved_stdout is not None:
+            sys.stdout = _saved_stdout
+
+
+def _discover_offsets_impl(data, bin_info):
+    """Offset discovery implementation (prints to current stdout)."""
     results = {}
     errors = []
     tiers_used = {}
@@ -2828,9 +2907,12 @@ def discover_offsets(data, bin_info):
         ts = bin_info['text_section']
         text_start = ts['raw_offset']
         text_end = text_start + ts['raw_size']
+        if fmt == 'pe' and text_start + 16 <= len(data):
+            prologue = data[text_start:text_start + 16]
+            if not any(p in prologue for p in (b'\x55', b'\x48\x89\xE5', b'\x48\x83\xEC', b'\xE8', b'\x48\x8B')):
+                print(f"  [WARN] PE .text at file 0x{text_start:X} does not contain common prologue bytes (55/48 89 E5/48 83 EC/E8)")
 
-    # --- Phase 0: ELF Symbol Table Shortcut (Linux) ----------------
-    sym_hints = {}  # {name: (func_file_start, func_file_end, sym_name)}
+    sym_hints = {}
     if bin_info and bin_info.get('has_symbols') and fmt in ('elf', 'macho'):
         print("\n" + "=" * 65)
         print("  PHASE 0: Symbol Table Resolution")
@@ -2881,7 +2963,6 @@ def discover_offsets(data, bin_info):
         if not sym_details:
             print("  No symbol matches found - falling through to signature scanning")
 
-    # --- Phase 1: Primary + Relaxed Signatures ---------------------
     print("\n" + "=" * 65)
     print("  PHASE 1: Signature Scanning (primary + relaxed)")
     print("=" * 65)
@@ -2931,68 +3012,67 @@ def discover_offsets(data, bin_info):
             results[sig.name] = config_off
             tiers_used[sig.name] = tier
 
-    # --- Phase 1c: Clang Alternate Patterns (non-PE platforms) -----
-    if fmt != 'pe':
-        still_missing = [sig.name for sig in SIGNATURES if sig.name not in results]
+    # --- Phase 1c: Clang Alternate Patterns (fallback for PE + non-PE when primary failed) -----
+    still_missing = [sig.name for sig in SIGNATURES if sig.name not in results]
+    if still_missing:
+        print("\n" + "=" * 65)
+        print("  PHASE 1c: Clang/Platform-Specific Alternates")
+        print("=" * 65)
+
+        for sig_name, pat_hex, target_off in CLANG_ALT_PATTERNS:
+            if sig_name not in still_missing:
+                continue
+            if sig_name in results:
+                continue
+
+            pattern = Signature._parse(pat_hex)
+            matches = scan_pattern(data, pattern, start=text_start, end=text_end)
+
+            if len(matches) == 0:
+                continue
+
+            # Try to disambiguate
+            resolved = matches
+            # Find the original Signature for expected_original / disambiguator
+            orig_sig = None
+            for s in SIGNATURES:
+                if s.name == sig_name:
+                    orig_sig = s
+                    break
+
+            if orig_sig and orig_sig.disambiguator and len(resolved) > 1:
+                valid = [m for m in resolved if orig_sig.disambiguator(data, m)]
+                if valid:
+                    resolved = valid
+
+            if orig_sig and orig_sig.expected_original and len(resolved) > 1:
+                expected = bytes.fromhex(orig_sig.expected_original.replace(' ', ''))
+                valid = []
+                for m in resolved:
+                    tf = m + target_off
+                    if 0 <= tf and tf + len(expected) <= len(data):
+                        if data[tf:tf+len(expected)] == expected:
+                            valid.append(m)
+                if valid:
+                    resolved = valid
+
+            if len(resolved) >= 1:
+                file_off = resolved[0] + target_off
+                if 0 <= file_off < len(data):
+                    ok, conf, _ = _run_patch_site_validation(data, file_off, orig_sig or {}, adj)
+                    if not ok:
+                        print(f"  [warn] {sig_name}: validation failed (confidence {conf}), skipping")
+                    else:
+                        config_off = file_off + adj
+                        ambig = f"(ambig:{len(resolved)})" if len(resolved) > 1 else ""
+                        tier = f"clang-alt{ambig}"
+                        print(f"  [CLNG] {sig_name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}] (conf={conf})")
+                        results[sig_name] = config_off
+                        tiers_used[sig_name] = tier
+                        still_missing = [n for n in still_missing if n != sig_name]
+
         if still_missing:
-            print("\n" + "=" * 65)
-            print("  PHASE 1c: Clang/Platform-Specific Alternates")
-            print("=" * 65)
-
-            for sig_name, pat_hex, target_off in CLANG_ALT_PATTERNS:
-                if sig_name not in still_missing:
-                    continue
-                if sig_name in results:
-                    continue
-
-                pattern = Signature._parse(pat_hex)
-                matches = scan_pattern(data, pattern, start=text_start, end=text_end)
-
-                if len(matches) == 0:
-                    continue
-
-                # Try to disambiguate
-                resolved = matches
-                # Find the original Signature for expected_original / disambiguator
-                orig_sig = None
-                for s in SIGNATURES:
-                    if s.name == sig_name:
-                        orig_sig = s
-                        break
-
-                if orig_sig and orig_sig.disambiguator and len(resolved) > 1:
-                    valid = [m for m in resolved if orig_sig.disambiguator(data, m)]
-                    if valid:
-                        resolved = valid
-
-                if orig_sig and orig_sig.expected_original and len(resolved) > 1:
-                    expected = bytes.fromhex(orig_sig.expected_original.replace(' ', ''))
-                    valid = []
-                    for m in resolved:
-                        tf = m + target_off
-                        if 0 <= tf and tf + len(expected) <= len(data):
-                            if data[tf:tf+len(expected)] == expected:
-                                valid.append(m)
-                    if valid:
-                        resolved = valid
-
-                if len(resolved) >= 1:
-                    file_off = resolved[0] + target_off
-                    if 0 <= file_off < len(data):
-                        ok, conf, _ = _run_patch_site_validation(data, file_off, orig_sig or {}, adj)
-                        if not ok:
-                            print(f"  [warn] {sig_name}: validation failed (confidence {conf}), skipping")
-                        else:
-                            config_off = file_off + adj
-                            ambig = f"(ambig:{len(resolved)})" if len(resolved) > 1 else ""
-                            tier = f"clang-alt{ambig}"
-                            print(f"  [CLNG] {sig_name:45s} = 0x{config_off:X}  (file 0x{file_off:X})  [{tier}] (conf={conf})")
-                            results[sig_name] = config_off
-                            tiers_used[sig_name] = tier
-                            still_missing = [n for n in still_missing if n != sig_name]
-
-            if still_missing:
-                print(f"  Still missing after Clang alts: {', '.join(still_missing)}")
+            print(f"  Still missing after Clang alts: {', '.join(still_missing)}")
 
     # --- Phase 1b: Patched Binary Fallbacks ------------------------
     patched_fallbacks = []
@@ -3144,11 +3224,56 @@ def discover_offsets(data, bin_info):
         print("  PHASE 2b: Heuristic Recovery")
         print("=" * 65)
 
+        # Use Linux/Windows insight: find 32000 literal in window near EmulateStereoSuccess1
+        # when derivation failed (e.g. macOS/Clang different layout).
+        if "EmulateBitrateModified" in missing and "EmulateStereoSuccess1" in results:
+            anchor_file = results["EmulateStereoSuccess1"] - adj
+            config_off, reason = _find_emulate_bitrate_in_anchor_window(data, anchor_file, adj, window=0x2000)
+            # Fallback: extend window using same-function bounds (Emulate48Khz / EmulateStereoSuccess2)
+            if config_off is None and "Emulate48Khz" in results and "EmulateStereoSuccess2" in results:
+                lo = min(anchor_file, results["Emulate48Khz"] - adj, results["EmulateStereoSuccess2"] - adj)
+                hi = max(anchor_file, results["Emulate48Khz"] - adj, results["EmulateStereoSuccess2"] - adj)
+                mid = (lo + hi) // 2
+                config_off, reason = _find_emulate_bitrate_in_anchor_window(
+                    data, mid, adj, window=(hi - lo) // 2 + 0x2000
+                )
+            # Scan entire .text if still missing (no 32000 in anchor/function window)
+            if config_off is None and text_start < text_end:
+                full_window = max(anchor_file - text_start, text_end - anchor_file)
+                if full_window > 0x2000:
+                    config_off, reason = _find_emulate_bitrate_in_anchor_window(data, anchor_file, adj, window=full_window)
+                    if config_off is not None:
+                        reason = f"full-text-scan({reason})"
+            if config_off is not None:
+                # Sanity: EBM must be in media region (within 0x20000 of anchor). Reject if full-text picked a far crypto imul.
+                ebm_file = config_off - adj
+                dist = abs(ebm_file - anchor_file)
+                if dist > 0x20000:
+                    print(f"  [REJECT] EmulateBitrateModified @ 0x{config_off:X} — too far from anchor (0x{dist:X} > 0x20000), skipping")
+                    config_off = None
+                else:
+                    tag = "FULL-TEXT" if "full-text-scan" in reason else "ANCHOR"
+                    print(f"  [{tag}] EmulateBitrateModified    = 0x{config_off:X}  [{reason}]  (delta from ESS1: 0x{dist:X})")
+                    results["EmulateBitrateModified"] = config_off
+                    tiers_used["EmulateBitrateModified"] = reason
+                    missing = [n for n in _all_offset_names() if n not in results]
+
         hints = _run_heuristic_scan(data, missing, adj, text_start, text_end)
+        # Collect far EmulateBitrateModified candidates for last-resort fallback (Mach-O x86_64 only)
+        ebm_far_candidates = []
         if hints:
+            # EmulateBitrateModified heuristic must be near EmulateStereoSuccess1 (same function)
+            # to avoid picking a random 32000 elsewhere (macOS/Clang layout can break derivation).
+            EMULATE_BITRATE_MAX_DISTANCE = 0x2000  # ~8KB
             for name, file_off, reason in hints:
                 if name in results:
                     continue
+                if name == "EmulateBitrateModified" and "EmulateStereoSuccess1" in results:
+                    anchor_file = results["EmulateStereoSuccess1"] - adj
+                    if abs(file_off - anchor_file) > EMULATE_BITRATE_MAX_DISTANCE:
+                        ebm_far_candidates.append((file_off, reason))
+                        print(f"  [HEUR] Rejected {name} @ 0x{file_off + adj:X} — too far from EmulateStereoSuccess1 (delta 0x{abs(file_off - anchor_file):X} > 0x{EMULATE_BITRATE_MAX_DISTANCE:X})")
+                        continue
                 config_off = file_off + adj
                 # Verify expected bytes before accepting heuristic result
                 _exp_map = _build_expected_map(fmt)
@@ -3162,7 +3287,25 @@ def discover_offsets(data, bin_info):
                 print(f"  [HEUR] {name:45s} = 0x{config_off:X}  [{reason}]")
                 results[name] = config_off
                 tiers_used[name] = f"heuristic({reason})"
-        else:
+
+        # Last-resort: Mach-O x86_64 — no 32000 in anchor window; accept closest far imul candidate
+        if "EmulateBitrateModified" not in results and ebm_far_candidates and fmt == "macho" and "EmulateStereoSuccess1" in results:
+            anchor_file = results["EmulateStereoSuccess1"] - adj
+            expected_32000 = bytes.fromhex("007D00")  # 3 bytes at patch site
+            valid = []
+            for file_off, reason in ebm_far_candidates:
+                if file_off + 3 <= len(data) and data[file_off:file_off + 3] == expected_32000:
+                    valid.append((file_off, abs(file_off - anchor_file)))
+            if valid:
+                valid.sort(key=lambda x: x[1])
+                file_off = valid[0][0]
+                config_off = file_off + adj
+                results["EmulateBitrateModified"] = config_off
+                tiers_used["EmulateBitrateModified"] = "fallback-far(imul 32000,closest-to-anchor)"
+                print(f"  [FALLBACK-FAR] EmulateBitrateModified = 0x{config_off:X}  (no in-window candidate; using closest imul 32000 — VERIFY bitrate after patch)")
+                missing = [n for n in _all_offset_names() if n not in results]
+
+        if not hints:
             print(f"  No heuristic candidates for: {', '.join(missing)}")
 
     validation_failures = _validate_discovered_offsets(results, data, adj)
@@ -3175,6 +3318,9 @@ def discover_offsets(data, bin_info):
     errors = [(n, e) for n, e in errors if n not in results]
 
     _prune_results_to_allowed(results, tiers_used, label=fmt)
+
+    # Audit 2e: context fingerprint for top-5 critical offsets (checksum for auditing)
+    _log_context_fingerprints(data, results, adj, fmt)
 
     return results, errors, adj, tiers_used
 
@@ -3376,10 +3522,6 @@ def _md5_file_hex(file_path, lower=False):
 
 
 # region Output Formatters
-# Output blocks are copy-paste compatible with:
-# - Windows: Discord_voice_node_patcher.ps1 (# region Offsets ... # endregion; order = $Script:RequiredOffsetNames)
-# - Linux:   discord_voice_patcher_linux.sh (EXPECTED_MD5, EXPECTED_SIZE, OFFSET_*=0xHEX, FILE_OFFSET_ADJUSTMENT=0)
-# - macOS:   declare -A OFFSETS=( [Name]=0xHEX ... ); FILE_OFFSET_ADJUSTMENT=0 (fat file offset for x86_64 slice)
 
 def format_powershell_config(results, bin_info=None, file_path=None, file_size=None):
     """Generate PowerShell offset table - copy-paste directly into patcher."""
@@ -3470,7 +3612,7 @@ _MONTHS_ASCII = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 
 def format_windows_patcher_block(results, bin_info, file_path, file_size):
-    """Generate Windows patcher block. Order must match $Script:RequiredOffsetNames in the patcher."""
+    """Windows patcher copy block; order = $Script:RequiredOffsetNames."""
     if not bin_info or not file_path or file_size is None:
         return None
     if bin_info.get('format') != 'pe':
@@ -3487,6 +3629,8 @@ def format_windows_patcher_block(results, bin_info, file_path, file_size):
         build_str = "PE binary"
     lines = [
         "# region Offsets (PASTE HERE)",
+        "# Paste output from: python discord_voice_node_offset_finder_v5.py <path\\to\\discord_voice.node>",
+        "# Required: exactly these 17 offsets (RVA hex). Copy the \"COPY BELOW -> Discord_voice_node_patcher.ps1\" block.",
         "",
         "$Script:OffsetsMeta = @{",
         '    FinderVersion = "discord_voice_node_offset_finder.py v%s"' % VERSION,
@@ -3497,7 +3641,6 @@ def format_windows_patcher_block(results, bin_info, file_path, file_size):
         "",
         "$Script:Offsets = @{",
     ]
-    # Same order as $Script:RequiredOffsetNames in Discord_voice_node_patcher.ps1
     ordered = WINDOWS_PATCHER_OFFSET_ORDER
     max_len = max((len(n) for n in ordered), default=0)
     for name in ordered:
@@ -3554,8 +3697,7 @@ def format_windows_debug_mode(results=None):
 
 
 def format_linux_patcher_block(results, bin_info, file_path, file_size):
-    """Generate Linux patcher offset block for copy-paste into discord_voice_patcher_linux.sh.
-    Uses file offsets (ELF). Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section."""
+    """Linux patcher copy block (ELF file offsets + EXPECTED_MD5/SIZE, REQUIRED_OFFSET_NAMES)."""
     if not bin_info or not file_path or file_size is None:
         return None
     fmt = bin_info.get('format', 'raw')
@@ -3566,13 +3708,13 @@ def format_linux_patcher_block(results, bin_info, file_path, file_size):
     lines = [
         "# --- Build fingerprint (update when targeting a new Discord build) ------------",
         "# Run: python discord_voice_node_offset_finder_v5.py <path/to/discord_voice.node>",
-        "# Copy the \"COPY BELOW -> discord_voice_patcher_linux.sh\" block into this section.",
+        "# Copy the \"COPY BELOW -> discord_voice_patcher_linux.sh\" block here.",
         f'EXPECTED_MD5="{md5}"',
         f"EXPECTED_SIZE={file_size}",
         "",
         "# --- Linux/ELF patch offsets --------------------------------------------------",
     ]
-    ordered = _all_offset_names()
+    ordered = WINDOWS_PATCHER_OFFSET_ORDER
     for name in ordered:
         if name in results:
             file_off = results[name] - adj
@@ -3580,7 +3722,17 @@ def format_linux_patcher_block(results, bin_info, file_path, file_size):
         else:
             lines.append(f"OFFSET_{name}=0x0")
     lines.append("FILE_OFFSET_ADJUSTMENT=0")
-    return "\n".join(lines)
+    lines.append("")
+    lines.append("# Required offset names (same 17 as Windows patcher); validate before build.")
+    lines.append("REQUIRED_OFFSET_NAMES=(")
+    lines.append("    CreateAudioFrameStereo AudioEncoderOpusConfigSetChannels MonoDownmixer")
+    lines.append("    EmulateStereoSuccess1 EmulateStereoSuccess2 EmulateBitrateModified")
+    lines.append("    SetsBitrateBitrateValue SetsBitrateBitwiseOr Emulate48Khz")
+    lines.append("    HighPassFilter HighpassCutoffFilter DcReject DownmixFunc")
+    lines.append("    AudioEncoderOpusConfigIsOk ThrowError")
+    lines.append("    EncoderConfigInit1 EncoderConfigInit2")
+    lines.append(")")
+    return "\n".join(lines) + "\n"
 
 
 def format_macos_patcher_block(results, bin_info, file_path, file_size):
@@ -3876,13 +4028,17 @@ def main():
     created_files = []
     atexit.register(_cleanup_created_files, created_files)
 
-    print("=" * 65)
-    print(f"  Discord Voice Node Offset Finder v{VERSION}")
-    print("  Cross-platform tiered scanning with chain-aware derivation")
-    print("=" * 65)
+    argv_list = [a for a in sys.argv[1:] if a not in ('--quiet', '-q')]
+    quiet = (len(sys.argv) > 1 and ('--quiet' in sys.argv or '-q' in sys.argv))
 
-    if len(sys.argv) >= 2:
-        file_path = Path(sys.argv[1])
+    if not quiet:
+        print("=" * 65)
+        print(f"  Discord Voice Node Offset Finder v{VERSION}")
+        print("  Cross-platform tiered scanning with chain-aware derivation")
+        print("=" * 65)
+
+    if argv_list:
+        file_path = Path(argv_list[0])
     else:
         print("\nNo file specified, searching for Discord install...")
         file_path = find_discord_node()
@@ -3898,9 +4054,10 @@ def main():
 
     data = file_path.read_bytes()
     file_size = len(data)
-    print(f"\n  File: {file_path}")
-    print(f"  Size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
-    print(f"  MD5:  {hashlib.md5(data).hexdigest()}")
+    if not quiet:
+        print(f"\n  File: {file_path}")
+        print(f"  Size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
+        print(f"  MD5:  {hashlib.md5(data).hexdigest()}")
 
     # --- Format detection ------------------------------------------
     bin_info = detect_binary_format(data)
@@ -3908,13 +4065,13 @@ def main():
     adj = bin_info.get('file_offset_adjustment', 0)
     arch = bin_info.get('arch', 'unknown')
 
-    print(f"\n  Binary Format:       {fmt.upper()}")
-    print(f"  Architecture:        {arch}")
+    if not quiet:
+        print(f"\n  Binary Format:       {fmt.upper()}")
+        print(f"  Architecture:        {arch}")
+        if bin_info.get('note'):
+            print(f"  NOTE: {bin_info['note']}")
 
-    if bin_info.get('note'):
-        print(f"  NOTE: {bin_info['note']}")
-
-    if fmt == 'pe':
+    if fmt == 'pe' and not quiet:
         print(f"  PE Image Base:       0x{bin_info['image_base']:X}")
         if 'build_time' in bin_info:
             print(f"  PE Timestamp:        {bin_info['build_time'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -3926,7 +4083,7 @@ def main():
         for s in bin_info.get('sections', []):
             print(f"    {s['name']:8s}  VA=0x{s['vaddr']:08X}  Size=0x{s['raw_size']:08X}  Raw=0x{s['raw_offset']:08X}")
 
-    elif fmt == 'elf':
+    elif fmt == 'elf' and not quiet:
         ts = bin_info.get('text_section')
         if ts:
             print(f"  Offset Adjustment:   0x{adj:X}  (.text VA 0x{ts['vaddr']:X} - raw 0x{ts['raw_offset']:X})")
@@ -3936,9 +4093,9 @@ def main():
         has_sym = bin_info.get('has_symbols', False)
         print(f"  Symbol Table:        {'YES' if has_sym else 'NO'} ({n_func} function symbols)")
         if has_sym:
-            print(f"  NOTE: Debug symbols present - using symbol table shortcut for offset resolution")
+            print(f"  NOTE: Linux nodes (Stable/PTB/Canary) are not stripped - using symbol table for offset resolution")
 
-    elif fmt == 'macho':
+    elif fmt == 'macho' and not quiet:
         ts = bin_info.get('text_section')
         if ts:
             print(f"  Offset Adjustment:   0x{adj:X}  (__TEXT,__text VA 0x{ts['vaddr']:X} - raw 0x{ts['raw_offset']:X})")
@@ -3957,7 +4114,7 @@ def main():
             n_func = len(bin_info.get('func_symbols', {}))
             print(f"  x86_64 Symbol Table: YES ({n_func} function symbols)")
 
-    elif fmt == 'raw':
+    elif fmt == 'raw' and not quiet:
         print(f"  WARNING: Could not parse binary format - using raw scan (adj=0)")
 
     # --- Backward compat: create pe_info alias for functions that expect it --
@@ -3971,324 +4128,368 @@ def main():
             bin_info["stereo_patches"] = stereo_patches
 
     # --- Run pipeline ----------------------------------------------
-    results, errors, adj, tiers_used = discover_offsets(data, bin_info)
-    verified, warnings = validate_offsets(data, results, adj, bin_fmt=fmt)
-    check_injection_sites(data, results, adj)
+    verbose = not quiet
+    if quiet:
+        _stdout_main = sys.stdout
+        sys.stdout = io.StringIO()
+    exit_code = 0
+    results, errors, adj, tiers_used = None, [], 0, {}
+    try:
+        results, errors, adj, tiers_used = discover_offsets(data, bin_info, verbose=verbose)
+        verified, warnings = validate_offsets(data, results, adj, bin_fmt=fmt)
+        check_injection_sites(data, results, adj)
 
-    if fmt == 'pe':
-        ts = bin_info.get('text_section')
-        if ts:
-            t_start = ts['raw_offset']
-            t_end = ts['raw_offset'] + ts['raw_size']
-        else:
-            t_start = 0
-            t_end = len(data)
-        run_bitrate_audit_pe(data, results, adj, t_start, t_end)
-
-    # --- Cross-validation ------------------------------------------
-    xval_warnings = _cross_validate(results, adj, data, tiers_used=tiers_used)
-    if xval_warnings:
-        print("\n" + "=" * 65)
-        print("  PHASE 5: Cross-Validation")
-        print("=" * 65)
-        for w in xval_warnings:
-            print(f"  [XVAL] {w}")
-
-    # --- ARM64 Offset Discovery (fat binary with arm64 slice) ------
-    arm64_results = {}
-    arm64_errors = []
-    arm64_adj = 0
-    arm64_tiers = {}
-    arm64_info = bin_info.get('arm64_info') if bin_info else None
-
-    if arm64_info and arm64_info.get('arch') == 'arm64':
-        print("\n" + "=" * 65)
-        print("  ARM64 OFFSET DISCOVERY (Apple Silicon)")
-        print("=" * 65)
-        n_arm64_sym = len(arm64_info.get('func_symbols', {}))
-        print(f"  arm64 slice: fat_offset=0x{arm64_info.get('fat_offset', 0):X}  "
-              f"size={arm64_info.get('fat_size', 0):,} bytes")
-        print(f"  arm64 symbols: {n_arm64_sym} functions  "
-              f"adjustment=0x{arm64_info.get('file_offset_adjustment', 0):X}")
-
-        arm64_results, arm64_errors, arm64_adj, arm64_tiers = \
-            discover_offsets_arm64(data, arm64_info)
-
-    # --- Visualization ---------------------------------------------
-    if len(results) >= 10:
-        viz_path = generate_viz_graph(results, file_path.parent)
-        if viz_path:
-            created_files.append(viz_path)
-            print(f"\n  Dependency graph saved: {viz_path}")
-
-    # --- Summary ---------------------------------------------------
-    print("\n" + "=" * 65)
-    print("  RESULTS SUMMARY")
-    print("=" * 65)
-    print(f"  Format:           {fmt.upper()} ({arch})")
-    if fmt == 'pe':
-        patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
-        print(f"  Windows patcher:   {patcher_count} / {len(PATCHER_OFFSET_NAMES)}  (required for Discord_voice_node_patcher.ps1)")
-        print(f"  x86_64 discovered: {len(results)} offsets")
-    else:
-        print(f"  x86_64 found:      {len(results)} / {len(ALL_OFFSET_NAMES)}")
-    print(f"  Bytes verified:   {verified}")
-    print(f"  Warnings:         {warnings}")
-    print(f"  Cross-validation: {len(xval_warnings)} issue(s)" if xval_warnings else "  Cross-validation: clean")
-    print(f"  Errors:           {len(errors)}")
-
-    if arm64_info:
-        print(f"  arm64 found:      {len(arm64_results)} / {len(ALL_OFFSET_NAMES)}")
-
-    # Show resolution tier breakdown
-    tier_counts = {}
-    for name, tier in tiers_used.items():
-        bucket = tier.split('(')[0].split('-')[0]
-        tier_counts[bucket] = tier_counts.get(bucket, 0) + 1
-    if tier_counts:
-        print(f"  Resolution:       {', '.join(f'{k}: {v}' for k, v in sorted(tier_counts.items()))}")
-
-    if errors:
-        print(f"\n  Failed offsets:")
-        for name, err in errors:
-            print(f"    {name}: {err}")
-
-    # --- Results Table (dual offset for non-PE) --------------------
-    if results and fmt != 'pe':
-        print("\n" + "=" * 65)
-        print("  OFFSET TABLE (config VA / file offset)")
-        print("=" * 65)
-        print(f"  {'Name':<45s} {'config_va':>12s} {'file_offset':>12s}  tier")
-        print(f"  {'-'*45} {'-'*12} {'-'*12}  {'-'*20}")
-        for name in _all_offset_names():
-            if name in results:
-                config_off = results[name]
-                file_off = config_off - adj
-                tier = tiers_used.get(name, '?')
-                print(f"  {name:<45s} 0x{config_off:>08X}  0x{file_off:>08X}  [{tier}]")
-            else:
-                print(f"  {name:<45s} {'NOT FOUND':>12s}")
-        print(f"\n  # Note: on macOS/Linux use the 'file_offset' values for direct binary patching")
-
-    # --- Output ----------------------------------------------------
-    if results:
-        # For Windows (PE), print the exact patcher block first so users copy the right thing
         if fmt == 'pe':
-            win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
-            if not win_block and bin_info and file_size is not None:
-                ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
-                if not ok:
-                    print(f"\n  [WARN] Windows patcher block skipped: {err}")
-            if win_block:
-                print("\n" + "=" * 65)
-                print("  COPY BELOW -> Discord_voice_node_patcher.ps1")
-                print("  Replace the entire # region Offsets (PASTE HERE) ... # endregion Offsets section")
-                print("=" * 65)
-                print("")
-                print("--- BEGIN COPY (Windows) ---")
-                print(win_block, end="")
-                print("--- END COPY ---")
-                print("")
-                print("  DEBUG MODE (matches patcher GUI groups)")
-                print("  " + "-" * 60)
-                print(format_windows_debug_mode(results))
-                print("")
+            ts = bin_info.get('text_section')
+            if ts:
+                t_start = ts['raw_offset']
+                t_end = ts['raw_offset'] + ts['raw_size']
+            else:
+                t_start = 0
+                t_end = len(data)
+            run_bitrate_audit_pe(data, results, adj, t_start, t_end)
 
-        if fmt != 'pe':
-            ps_config = format_powershell_config(results, bin_info, file_path, file_size)
+        # --- Cross-validation ------------------------------------------
+        xval_warnings = _cross_validate(results, adj, data, tiers_used=tiers_used)
+        if xval_warnings:
             print("\n" + "=" * 65)
-            print("  PATCHER OFFSET TABLE (copy-paste into patcher)")
+            print("  PHASE 5: Cross-Validation")
             print("=" * 65)
-            print(ps_config)
+            for w in xval_warnings:
+                print(f"  [XVAL] {w}")
 
-        if fmt == 'elf':
-            linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
-            if linux_block:
-                print("\n" + "=" * 65)
-                print("  COPY BELOW -> discord_voice_patcher_linux.sh")
-                print("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section")
-                print("=" * 65)
-                print("")
-                print("--- BEGIN COPY (Linux) ---")
-                print(linux_block)
-                print("--- END COPY ---")
-                print("")
-        elif fmt == 'macho':
-            macos_block = format_macos_patcher_block(results, bin_info, file_path, file_size)
-            if macos_block:
-                print("\n" + "=" * 65)
-                print("  COPY BELOW -> discord_voice_patcher_macos.sh")
-                print("  Replace the declare -A OFFSETS and comment block (x86_64 slice)")
-                print("=" * 65)
-                print("")
-                print("--- BEGIN COPY (macOS) ---")
-                print(macos_block)
-                print("--- END COPY ---")
-                print("")
+        # --- ARM64 Offset Discovery (fat binary with arm64 slice) ------
+        arm64_results = {}
+        arm64_errors = []
+        arm64_adj = 0
+        arm64_tiers = {}
+        arm64_info = bin_info.get('arm64_info') if bin_info else None
 
-        # Non-PE: also show file offsets block
-        if fmt != 'pe':
-            offset_names = _all_offset_names()
-            max_name_len = max(len(n) for n in offset_names)
-            print("\n    # File offsets for direct binary patching (hex editor):")
-            print("    FileOffsets = @{")
-            for name in offset_names:
-                pad = " " * (max_name_len - len(name))
-                if name in results:
-                    file_off = results[name] - adj
-                    print(f"        {name}{pad} = 0x{file_off:X}")
-                else:
-                    print(f"        {name}{pad} = 0x0")
-            print("    }")
-
-        stub_line = ""
-        if fmt == 'pe' and bin_info and "HighpassCutoffFilter" in results:
-            hpc_va = bin_info['image_base'] + results["HighpassCutoffFilter"]
-            va_bytes = struct.pack('<Q', hpc_va)
-            stub = b'\x48\xB8' + va_bytes + b'\xC3'
-            stub_line = f"\n  HighPassFilter stub: {stub.hex(' ')}\n    mov rax, 0x{hpc_va:X}; ret"
-            print(stub_line)
-
-        # --- macOS Stereo Patch Table (when applicable) -----------------
-        if fmt == 'macho' and stereo_patches:
+        if arm64_info and arm64_info.get('arch') == 'arm64':
             print("\n" + "=" * 65)
-            print("  macOS STEREO MIC PATCH TABLE (x86_64 + arm64)")
+            print("  ARM64 OFFSET DISCOVERY (Apple Silicon)")
             print("=" * 65)
-            print(f"  {'#':<3} {'Arch':<8} {'Fat Offset':<14} {'Orig->Patch':<30} {'Name'}")
-            print(f"  {'-'*3} {'-'*8} {'-'*14} {'-'*30} {'-'*30}")
-            for i, p in enumerate(stereo_patches, 1):
-                print(f"  {i:<3} {p['arch']:<8} 0x{p['fat_offset']:08X}     {p['orig']}->{p['patch']:<20} {p['name']}")
-            print(f"\n  Total: {len(stereo_patches)} stereo patches (fat_offset = direct file offset for patching)")
+            n_arm64_sym = len(arm64_info.get('func_symbols', {}))
+            print(f"  arm64 slice: fat_offset=0x{arm64_info.get('fat_offset', 0):X}  "
+                  f"size={arm64_info.get('fat_size', 0):,} bytes")
+            print(f"  arm64 symbols: {n_arm64_sym} functions  "
+                  f"adjustment=0x{arm64_info.get('file_offset_adjustment', 0):X}")
 
-        # --- ARM64 Offset Table (when applicable) ---------------------
-        if arm64_results:
-            arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
+            arm64_results, arm64_errors, arm64_adj, arm64_tiers = \
+                discover_offsets_arm64(data, arm64_info)
+
+        # --- Visualization ---------------------------------------------
+        if len(results) >= 10:
+            viz_path = generate_viz_graph(results, file_path.parent)
+            if viz_path:
+                created_files.append(viz_path)
+                print(f"\n  Dependency graph saved: {viz_path}")
+
+        # --- Summary ---------------------------------------------------
+        print("\n" + "=" * 65)
+        print("  RESULTS SUMMARY")
+        print("=" * 65)
+        print(f"  Format:           {fmt.upper()} ({arch})")
+        if fmt == 'pe':
+            patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+            print(f"  Windows patcher:   {patcher_count} / {len(PATCHER_OFFSET_NAMES)}  (required for Discord_voice_node_patcher.ps1)")
+            print(f"  x86_64 discovered: {len(results)} offsets")
+        else:
+            print(f"  x86_64 found:      {len(results)} / {len(ALL_OFFSET_NAMES)}")
+        print(f"  Bytes verified:   {verified}")
+        print(f"  Warnings:         {warnings}")
+        print(f"  Cross-validation: {len(xval_warnings)} issue(s)" if xval_warnings else "  Cross-validation: clean")
+        print(f"  Errors:           {len(errors)}")
+
+        if arm64_info:
+            print(f"  arm64 found:      {len(arm64_results)} / {len(ALL_OFFSET_NAMES)}")
+
+        # Show resolution tier breakdown
+        tier_counts = {}
+        for name, tier in tiers_used.items():
+            bucket = tier.split('(')[0].split('-')[0]
+            tier_counts[bucket] = tier_counts.get(bucket, 0) + 1
+        if tier_counts:
+            print(f"  Resolution:       {', '.join(f'{k}: {v}' for k, v in sorted(tier_counts.items()))}")
+
+        if errors:
+            print(f"\n  Failed offsets:")
+            for name, err in errors:
+                print(f"    {name}: {err}")
+
+        # --- Results Table (dual offset for non-PE) --------------------
+        if results and fmt != 'pe':
             print("\n" + "=" * 65)
-            print("  ARM64 OFFSET TABLE (slice VA / file offset / fat offset)")
+            print("  OFFSET TABLE (config VA / file offset)")
             print("=" * 65)
-            print(f"  {'Name':<45s} {'slice_va':>12s} {'file_off':>12s} {'fat_off':>12s}  tier")
-            print(f"  {'-'*45} {'-'*12} {'-'*12} {'-'*12}  {'-'*20}")
+            print(f"  {'Name':<45s} {'config_va':>12s} {'file_offset':>12s}  tier")
+            print(f"  {'-'*45} {'-'*12} {'-'*12}  {'-'*20}")
             for name in _all_offset_names():
-                if name in arm64_results:
-                    config_off = arm64_results[name]
-                    file_off = config_off - arm64_adj
-                    fat_off = arm64_fat_off + file_off
-                    tier = arm64_tiers.get(name, '?')
-                    print(f"  {name:<45s} 0x{config_off:>08X}  0x{file_off:>08X}  0x{fat_off:>08X}  [{tier}]")
+                if name in results:
+                    config_off = results[name]
+                    file_off = config_off - adj
+                    tier = tiers_used.get(name, '?')
+                    print(f"  {name:<45s} 0x{config_off:>08X}  0x{file_off:>08X}  [{tier}]")
                 else:
                     print(f"  {name:<45s} {'NOT FOUND':>12s}")
-            print(f"\n  # fat_offset = direct file offset for patching the fat binary")
+            print(f"\n  # Note: on macOS/Linux use the 'file_offset' values for direct binary patching")
 
-            # ARM64 file offsets block
-            print("\n    # ARM64 file offsets for direct binary patching:")
-            print("    ARM64_FileOffsets = @{")
-            max_nm = max(len(n) for n in _all_offset_names())
-            for name in _all_offset_names():
-                pad = " " * (max_nm - len(name))
-                if name in arm64_results:
-                    file_off = arm64_results[name] - arm64_adj
-                    fat_off = arm64_fat_off + file_off
-                    print(f"        {name}{pad} = 0x{fat_off:X}  # slice_off=0x{file_off:X}")
-                else:
-                    print(f"        {name}{pad} = 0x0")
-            print("    }")
+        # --- Output ----------------------------------------------------
+        if results:
+            # For Windows (PE), print the exact patcher block first so users copy the right thing
+            if fmt == 'pe':
+                win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
+                if not win_block and bin_info and file_size is not None:
+                    ok, err = _validate_pe_offsets_for_patcher(results, bin_info, file_size)
+                    if not ok:
+                        print(f"\n  [WARN] Windows patcher block skipped: {err}")
+                if win_block:
+                    print("\n" + "=" * 65)
+                    print("  COPY BELOW -> Discord_voice_node_patcher.ps1")
+                    print("  Replace the entire # region Offsets (PASTE HERE) ... # endregion Offsets section")
+                    print("=" * 65)
+                    print("")
+                    print("--- BEGIN COPY (Windows) ---")
+                    print(win_block, end="")
+                    print("--- END COPY ---")
+                    print("")
+                    print("  DEBUG MODE (matches patcher GUI groups)")
+                    print("  " + "-" * 60)
+                    print(format_windows_debug_mode(results))
+                    print("")
 
-        # Save offsets.txt
-        script_dir = Path(__file__).resolve().parent
-        if fmt == 'pe':
-            wb = format_windows_patcher_block(results, bin_info, file_path, file_size)
-            file_content = [wb] if wb else []
-        else:
-            ps_config = format_powershell_config(results, bin_info, file_path, file_size)
-            file_content = [ps_config]
-            file_content.append("\n# x86_64 file offsets for direct binary patching:")
-            for name in _all_offset_names():
-                if name in results:
-                    file_content.append(f"# {name} = file:0x{results[name] - adj:X}  config:0x{results[name]:X}")
+            if fmt != 'pe':
+                ps_config = format_powershell_config(results, bin_info, file_path, file_size)
+                print("\n" + "=" * 65)
+                print("  PATCHER OFFSET TABLE (copy-paste into patcher)")
+                print("=" * 65)
+                print(ps_config)
 
-        if arm64_results:
-            arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
-            file_content.append("\n# ARM64 fat offsets for direct binary patching:")
-            for name in _all_offset_names():
-                if name in arm64_results:
-                    file_off = arm64_results[name] - arm64_adj
-                    fat_off = arm64_fat_off + file_off
-                    file_content.append(f"# ARM64 {name} = fat:0x{fat_off:X}  slice:0x{file_off:X}")
+            if fmt == 'elf':
+                linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
+                if linux_block:
+                    print("\n" + "=" * 65)
+                    print("  COPY BELOW -> discord_voice_patcher_linux.sh")
+                    print("  Replace EXPECTED_MD5, EXPECTED_SIZE, and OFFSET_* section")
+                    print("=" * 65)
+                    print("")
+                    print("--- BEGIN COPY (Linux) ---")
+                    print(linux_block)
+                    print("--- END COPY ---")
+                    print("")
+            elif fmt == 'macho':
+                macos_block = format_macos_patcher_block(results, bin_info, file_path, file_size)
+                if macos_block:
+                    print("\n" + "=" * 65)
+                    print("  COPY BELOW -> discord_voice_patcher_macos.sh")
+                    print("  Replace the declare -A OFFSETS and comment block (x86_64 slice)")
+                    print("=" * 65)
+                    print("")
+                    print("--- BEGIN COPY (macOS) ---")
+                    print(macos_block)
+                    print("--- END COPY ---")
+                    print("")
 
-        for try_dir in [script_dir, file_path.parent, Path.cwd()]:
-            try:
-                out_path = try_dir / "offsets.txt"
-                out_path.write_text("\n".join(file_content), encoding="ascii")
-                created_files.append(out_path)
-                print(f"\n  Offset file saved: {out_path}")
-                break
-            except Exception:
-                continue
+            # Non-PE: also show file offsets block
+            if fmt != 'pe':
+                offset_names = _all_offset_names()
+                max_name_len = max(len(n) for n in offset_names)
+                print("\n    # File offsets for direct binary patching (hex editor):")
+                print("    FileOffsets = @{")
+                for name in offset_names:
+                    pad = " " * (max_name_len - len(name))
+                    if name in results:
+                        file_off = results[name] - adj
+                        print(f"        {name}{pad} = 0x{file_off:X}")
+                    else:
+                        print(f"        {name}{pad} = 0x0")
+                print("    }")
 
-        try:
-            json_path = file_path.with_suffix('.offsets.json')
-            json_text = format_json(results, bin_info, file_path, file_size, adj, tiers_used)
-            # Append arm64 results to JSON if available
+            stub_line = ""
+            if fmt == 'pe' and bin_info and "HighpassCutoffFilter" in results:
+                hpc_va = bin_info['image_base'] + results["HighpassCutoffFilter"]
+                va_bytes = struct.pack('<Q', hpc_va)
+                stub = b'\x48\xB8' + va_bytes + b'\xC3'
+                stub_line = f"\n  HighPassFilter stub: {stub.hex(' ')}\n    mov rax, 0x{hpc_va:X}; ret"
+                print(stub_line)
+
+            # --- macOS Stereo Patch Table (when applicable) -----------------
+            if fmt == 'macho' and stereo_patches:
+                print("\n" + "=" * 65)
+                print("  macOS STEREO MIC PATCH TABLE (x86_64 + arm64)")
+                print("=" * 65)
+                print(f"  {'#':<3} {'Arch':<8} {'Fat Offset':<14} {'Orig->Patch':<30} {'Name'}")
+                print(f"  {'-'*3} {'-'*8} {'-'*14} {'-'*30} {'-'*30}")
+                for i, p in enumerate(stereo_patches, 1):
+                    print(f"  {i:<3} {p['arch']:<8} 0x{p['fat_offset']:08X}     {p['orig']}->{p['patch']:<20} {p['name']}")
+                print(f"\n  Total: {len(stereo_patches)} stereo patches (fat_offset = direct file offset for patching)")
+
+            # --- ARM64 Offset Table (when applicable) ---------------------
             if arm64_results:
-                import json as _json
+                arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
+                print("\n" + "=" * 65)
+                print("  ARM64 OFFSET TABLE (slice VA / file offset / fat offset)")
+                print("=" * 65)
+                print(f"  {'Name':<45s} {'slice_va':>12s} {'file_off':>12s} {'fat_off':>12s}  tier")
+                print(f"  {'-'*45} {'-'*12} {'-'*12} {'-'*12}  {'-'*20}")
+                for name in _all_offset_names():
+                    if name in arm64_results:
+                        config_off = arm64_results[name]
+                        file_off = config_off - arm64_adj
+                        fat_off = arm64_fat_off + file_off
+                        tier = arm64_tiers.get(name, '?')
+                        print(f"  {name:<45s} 0x{config_off:>08X}  0x{file_off:>08X}  0x{fat_off:>08X}  [{tier}]")
+                    else:
+                        print(f"  {name:<45s} {'NOT FOUND':>12s}")
+                print(f"\n  # fat_offset = direct file offset for patching the fat binary")
+
+                # ARM64 file offsets block
+                print("\n    # ARM64 file offsets for direct binary patching:")
+                print("    ARM64_FileOffsets = @{")
+                max_nm = max(len(n) for n in _all_offset_names())
+                for name in _all_offset_names():
+                    pad = " " * (max_nm - len(name))
+                    if name in arm64_results:
+                        file_off = arm64_results[name] - arm64_adj
+                        fat_off = arm64_fat_off + file_off
+                        print(f"        {name}{pad} = 0x{fat_off:X}  # slice_off=0x{file_off:X}")
+                    else:
+                        print(f"        {name}{pad} = 0x0")
+                print("    }")
+
+            # Save offsets.txt
+            script_dir = Path(__file__).resolve().parent
+            if fmt == 'pe':
+                wb = format_windows_patcher_block(results, bin_info, file_path, file_size)
+                file_content = [wb] if wb else []
+            else:
+                ps_config = format_powershell_config(results, bin_info, file_path, file_size)
+                file_content = [ps_config]
+                file_content.append("\n# x86_64 file offsets for direct binary patching:")
+                for name in _all_offset_names():
+                    if name in results:
+                        file_content.append(f"# {name} = file:0x{results[name] - adj:X}  config:0x{results[name]:X}")
+
+            if arm64_results:
+                arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
+                file_content.append("\n# ARM64 fat offsets for direct binary patching:")
+                for name in _all_offset_names():
+                    if name in arm64_results:
+                        file_off = arm64_results[name] - arm64_adj
+                        fat_off = arm64_fat_off + file_off
+                        file_content.append(f"# ARM64 {name} = fat:0x{fat_off:X}  slice:0x{file_off:X}")
+
+            for try_dir in [script_dir, file_path.parent, Path.cwd()]:
                 try:
-                    jdata = _json.loads(json_text)
-                    arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
-                    arm64_out = {}
-                    for name in _all_offset_names():
-                        if name in arm64_results:
-                            file_off = arm64_results[name] - arm64_adj
-                            arm64_out[name] = {
-                                "slice_va": arm64_results[name],
-                                "slice_file_offset": file_off,
-                                "fat_offset": arm64_fat_off + file_off,
-                                "tier": arm64_tiers.get(name, "?"),
-                            }
-                    jdata["arm64_offsets"] = arm64_out
-                    jdata["arm64_found"] = len(arm64_results)
-                    json_text = _json.dumps(jdata, indent=2)
+                    out_path = try_dir / "offsets.txt"
+                    out_path.write_text("\n".join(file_content), encoding="ascii")
+                    created_files.append(out_path)
+                    print(f"\n  Offset file saved: {out_path}")
+                    break
                 except Exception:
-                    pass
-            json_path.write_text(json_text, encoding="ascii")
-            created_files.append(json_path)
-            print(f"  JSON saved: {json_path}")
-        except Exception:
-            pass
+                    continue
 
-    # --- Exit code -------------------------------------------------
-    total_x86 = len(results)
-    total_arm64 = len(arm64_results) if arm64_results else -1
-    patcher_ok = all(k in results for k in PATCHER_OFFSET_NAMES) if results else False
+            try:
+                json_path = file_path.with_suffix('.offsets.json')
+                json_text = format_json(results, bin_info, file_path, file_size, adj, tiers_used)
+                # Append arm64 results to JSON if available
+                if arm64_results:
+                    import json as _json
+                    try:
+                        jdata = _json.loads(json_text)
+                        arm64_fat_off = arm64_info.get('fat_offset', 0) if arm64_info else 0
+                        arm64_out = {}
+                        for name in _all_offset_names():
+                            if name in arm64_results:
+                                file_off = arm64_results[name] - arm64_adj
+                                arm64_out[name] = {
+                                    "slice_va": arm64_results[name],
+                                    "slice_file_offset": file_off,
+                                    "fat_offset": arm64_fat_off + file_off,
+                                    "tier": arm64_tiers.get(name, "?"),
+                                }
+                        jdata["arm64_offsets"] = arm64_out
+                        jdata["arm64_found"] = len(arm64_results)
+                        json_text = _json.dumps(jdata, indent=2)
+                    except Exception:
+                        pass
+                json_path.write_text(json_text, encoding="ascii")
+                created_files.append(json_path)
+                print(f"  JSON saved: {json_path}")
+            except Exception:
+                pass
 
-    n_patcher = len(PATCHER_OFFSET_NAMES)
-    if fmt == 'pe':
-        if patcher_ok:
-            print(f"\n  *** ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND ***")
-            return 0
-        got = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
-        if got > 0:
-            print(f"\n  *** PARTIAL: {got}/{n_patcher} Windows patcher offsets ***")
-            return 1
-        print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_patcher} ***")
-        return 2
-    n_required = len(ALL_OFFSET_NAMES)
-    arm64_ok = (total_arm64 < 0) or (total_arm64 == n_required)
-    if total_x86 == n_required and arm64_ok:
-        msg = f"*** ALL {n_required} x86_64 OFFSETS FOUND SUCCESSFULLY ***"
-        if total_arm64 >= 0:
-            msg += f"  |  arm64: {total_arm64}/{n_required}"
-        print(f"\n  {msg}")
-        return 0
-    elif total_x86 >= n_required - 2:
-        print(f"\n  *** PARTIAL SUCCESS: {total_x86}/{n_required} x86_64 offsets found ***", end="")
-        if total_arm64 >= 0 and total_arm64 < n_required:
-            print(f"  (arm64: {total_arm64}/{n_required})")
+        # --- Exit code -------------------------------------------------
+        total_x86 = len(results)
+        total_arm64 = len(arm64_results) if arm64_results else -1
+        patcher_ok = all(k in results for k in PATCHER_OFFSET_NAMES) if results else False
+
+        n_patcher = len(PATCHER_OFFSET_NAMES)
+        if fmt == 'pe':
+            if patcher_ok:
+                print(f"\n  *** ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND ***")
+                exit_code = 0
+            else:
+                got = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+                if got > 0:
+                    print(f"\n  *** PARTIAL: {got}/{n_patcher} Windows patcher offsets ***")
+                    exit_code = 1
+                else:
+                    print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_patcher} ***")
+                    exit_code = 2
         else:
-            print()
-        return 1
-    else:
-        print(f"\n  *** INSUFFICIENT RESULTS: {total_x86}/{n_required} x86_64 offsets found ***")
-        return 2
+            n_required = len(ALL_OFFSET_NAMES)
+            arm64_ok = (total_arm64 < 0) or (total_arm64 == n_required)
+            if total_x86 == n_required and arm64_ok:
+                msg = f"*** ALL {n_required} x86_64 OFFSETS FOUND SUCCESSFULLY ***"
+                if total_arm64 >= 0:
+                    msg += f"  |  arm64: {total_arm64}/{n_required}"
+                print(f"\n  {msg}")
+                exit_code = 0
+            elif total_x86 >= n_required - 2:
+                print(f"\n  *** PARTIAL SUCCESS: {total_x86}/{n_required} x86_64 offsets found ***", end="")
+                if total_arm64 >= 0 and total_arm64 < n_required:
+                    print(f"  (arm64: {total_arm64}/{n_required})")
+                else:
+                    print()
+                exit_code = 1
+            else:
+                print(f"\n  *** INSUFFICIENT RESULTS: {total_x86}/{n_required} x86_64 offsets found ***")
+                exit_code = 2
+    finally:
+        if quiet:
+            sys.stdout = _stdout_main
+            if fmt == 'pe' and results:
+                patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+                xval = _cross_validate(results, adj, data, tiers_used=tiers_used)
+                print("  {} / 17  (required for Discord_voice_node_patcher.ps1)".format(patcher_count))
+                print("  x86_64 discovered: {} offsets".format(len(results)))
+                if patcher_count == 17:
+                    print("  [OK] ALL 17 WINDOWS PATCHER OFFSETS FOUND")
+                else:
+                    print("  *** PARTIAL: {}/17 ***".format(patcher_count))
+                print("  Cross-validation: clean" if not xval else "  Cross-validation: {} issue(s)".format(len(xval)))
+                win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
+                if win_block:
+                    print("")
+                    print("--- BEGIN COPY (Windows) ---")
+                    print(win_block, end="")
+                    print("--- END COPY ---")
+            elif fmt == 'elf' and results:
+                linux_block = format_linux_patcher_block(results, bin_info, file_path, file_size)
+                if linux_block:
+                    print("")
+                    print("--- BEGIN COPY (Linux) ---")
+                    print(linux_block)
+                    print("--- END COPY ---")
+            elif fmt == 'macho' and results:
+                macos_block = format_macos_patcher_block(results, bin_info, file_path, file_size)
+                if macos_block:
+                    print("")
+                    print("--- BEGIN COPY (macOS) ---")
+                    print(macos_block)
+                    print("--- END COPY ---")
+    return exit_code
 
 
 if __name__ == '__main__':
