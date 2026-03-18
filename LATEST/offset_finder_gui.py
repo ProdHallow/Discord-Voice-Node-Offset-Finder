@@ -358,6 +358,8 @@ class OffsetFinderGUI:
         if not os.path.isfile(path):
             self._append_output(f"  [ERROR] File not found: {path}\n", "fail")
             return
+
+        self._load_finder()
         if self.finder_module is None:
             self._append_output("  [ERROR] Offset finder script not loaded.\n", "fail")
             self._append_output("  Place the offset finder .py script in the same folder as this GUI.\n", "info")
@@ -473,6 +475,9 @@ class OffsetFinderGUI:
                     self._append_output_safe("  Cross-validation: clean\n", "pass")
 
             arm64_found = 0
+            arm64_results = {}
+            arm64_adj = 0
+            arm64_tiers = {}
             arm64_info = bin_info.get("arm64_info")
             if arm64_info and hasattr(mod, "discover_offsets_arm64"):
                 if verbose:
@@ -530,6 +535,18 @@ class OffsetFinderGUI:
                     self._append_output_safe(f"  *** PARTIAL: {patcher_count}/17 ***\n", "warn")
                 self._append_output_safe("  Cross-validation: clean\n" if not xval else f"  Cross-validation: {len(xval)} issue(s)\n", "pass" if not xval else "warn")
 
+            if not verbose and not is_pe:
+                if found == n_expected:
+                    self._append_output_safe(f"  [OK] ALL {found}/{n_expected} x86_64 OFFSETS FOUND\n", "success")
+                else:
+                    self._append_output_safe(f"  x86_64: {found}/{n_expected} offsets\n", "warn" if found < n_expected else "info")
+                if arm64_found > 0:
+                    if arm64_found == n_expected:
+                        self._append_output_safe(f"  [OK] ALL {arm64_found}/{n_expected} arm64 OFFSETS FOUND\n", "success")
+                    else:
+                        self._append_output_safe(f"  arm64: {arm64_found}/{n_expected} offsets\n", "warn")
+                self._append_output_safe("  Cross-validation: clean\n" if not xval else f"  Cross-validation: {len(xval)} issue(s)\n", "pass" if not xval else "warn")
+
             if fmt == "pe" and hasattr(mod, "format_windows_patcher_block"):
                 # Finder v5.1+: 17 offsets; signature is (results, bin_info, path, file_size)
                 block = mod.format_windows_patcher_block(results, bin_info, path, file_size)
@@ -553,7 +570,7 @@ class OffsetFinderGUI:
                         self._append_output_safe("  " + "-" * 55 + "\n", "header")
                         self._append_output_safe(mod.format_windows_debug_mode(results) + "\n\n", None)
 
-            if verbose and fmt != "pe":
+            if verbose and fmt == "elf":
                 self._append_output_safe("\n", None)
                 ps_text = None
                 old_stdout = sys.stdout
@@ -588,16 +605,16 @@ class OffsetFinderGUI:
                 else:
                     self.last_linux_block = ""
             elif fmt == "macho" and hasattr(mod, "format_macos_patcher_block"):
-                block = mod.format_macos_patcher_block(results, bin_info, path, file_size)
+                block = mod.format_macos_patcher_block(
+                    results, bin_info, path, file_size,
+                    arm64_results=arm64_results if arm64_results else None,
+                    arm64_info=arm64_info,
+                    arm64_adj=arm64_adj if arm64_results else None)
                 if block:
                     self.last_macos_block = _ascii_safe(block)
                     self.last_windows_block = ""
                     self.last_linux_block = ""
-                    if verbose:
-                        self._append_output_safe("\n  " + "=" * 55 + "\n", "header")
-                        self._append_output_safe("  COPY BELOW -> discord_voice_patcher_macos.sh\n", "header")
-                        self._append_output_safe("  Replace the declare -A OFFSETS and comment block (x86_64)\n", "info")
-                        self._append_output_safe("  " + "=" * 55 + "\n\n", "header")
+                    self._append_output_safe("\n", None)
                     self._append_output_safe("--- BEGIN COPY (macOS) ---\n", None)
                     self._append_output_safe(block + "\n", None)
                     self._append_output_safe("--- END COPY ---\n\n", None)
@@ -607,7 +624,15 @@ class OffsetFinderGUI:
             if self.save_json.get():
                 try:
                     json_path = Path(path).with_suffix(".offsets.json")
-                    json_text = mod.format_json(results, bin_info, path, len(data), adj, tiers_used)
+                    try:
+                        json_text = mod.format_json(
+                            results, bin_info, path, len(data), adj, tiers_used,
+                            arm64_results=arm64_results if arm64_results else None,
+                            arm64_info=arm64_info,
+                            arm64_adj=arm64_adj if arm64_results else None,
+                            arm64_tiers=arm64_tiers if arm64_results else None)
+                    except TypeError:
+                        json_text = mod.format_json(results, bin_info, path, len(data), adj, tiers_used)
                     json_path.write_text(json_text, encoding="ascii")
                     self._append_output_safe(f"\n  JSON saved: {json_path}\n", "info")
                 except Exception as e:
