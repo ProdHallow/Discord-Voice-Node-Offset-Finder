@@ -2412,6 +2412,19 @@ WINDOWS_PATCHER_OFFSET_NAMES = list(ALL_OFFSET_NAMES)
 
 PATCHER_OFFSET_NAMES = WINDOWS_PATCHER_OFFSET_NAMES
 
+if len(ALL_OFFSET_NAMES) != len(set(ALL_OFFSET_NAMES)):
+    raise RuntimeError("ALL_OFFSET_NAMES has duplicate entries (breaks patcher hit counting)")
+if len(PATCHER_OFFSET_NAMES) != len(set(PATCHER_OFFSET_NAMES)):
+    raise RuntimeError("PATCHER_OFFSET_NAMES has duplicate entries")
+
+
+def count_patcher_offsets_found(results, patcher_names=None):
+    """Return (hits, required) using a de-duplicated patcher name list (stable order)."""
+    names = list(dict.fromkeys(patcher_names or PATCHER_OFFSET_NAMES))
+    hits = sum(1 for k in names if k in results)
+    return hits, len(names)
+
+
 ALLOWED_OFFSET_NAMES = frozenset(ALL_OFFSET_NAMES)
 for _map_name, _map in (("ELF_SYMBOL_MAP", ELF_SYMBOL_MAP), ("ARM64_SYMBOL_MAP", ARM64_SYMBOL_MAP)):
     _extra = set(_map.keys()) - ALLOWED_OFFSET_NAMES
@@ -3316,6 +3329,11 @@ def _discover_offsets_impl(data, bin_info):
         print(f"  [INVALID] {name}: {reason}")
 
     errors = [(n, e) for n, e in errors if n not in results]
+    _err_seen = {}
+    for n, e in errors:
+        if n not in _err_seen:
+            _err_seen[n] = e
+    errors = list(_err_seen.items())
 
     _prune_results_to_allowed(results, tiers_used, label=fmt)
 
@@ -4234,8 +4252,8 @@ def main():
         print("=" * 65)
         print(f"  Format:           {fmt.upper()} ({arch})")
         if fmt == 'pe':
-            patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
-            print(f"  Windows patcher:   {patcher_count} / {len(PATCHER_OFFSET_NAMES)}  (required for Discord_voice_node_patcher.ps1)")
+            patcher_count, n_pk = count_patcher_offsets_found(results)
+            print(f"  Windows patcher:   {patcher_count} / {n_pk}  (required for Discord_voice_node_patcher.ps1)")
             print(f"  x86_64 discovered: {len(results)} offsets")
         else:
             print(f"  x86_64 found:      {len(results)} / {len(ALL_OFFSET_NAMES)}")
@@ -4402,20 +4420,19 @@ def main():
         # --- Exit code -------------------------------------------------
         total_x86 = len(results)
         total_arm64 = len(arm64_results) if arm64_results else -1
-        patcher_ok = all(k in results for k in PATCHER_OFFSET_NAMES) if results else False
+        patcher_hits, n_pk = count_patcher_offsets_found(results or {})
+        patcher_ok = (patcher_hits == n_pk) if results else False
 
-        n_patcher = len(PATCHER_OFFSET_NAMES)
         if fmt == 'pe':
             if patcher_ok:
-                print(f"\n  *** ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND ***")
+                print(f"\n  *** ALL {n_pk} WINDOWS PATCHER OFFSETS FOUND ***")
                 exit_code = 0
             else:
-                got = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
-                if got > 0:
-                    print(f"\n  *** PARTIAL: {got}/{n_patcher} Windows patcher offsets ***")
+                if patcher_hits > 0:
+                    print(f"\n  *** PARTIAL: {patcher_hits}/{n_pk} Windows patcher offsets ***")
                     exit_code = 1
                 else:
-                    print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_patcher} ***")
+                    print(f"\n  *** INSUFFICIENT: Windows patcher needs all {n_pk} ***")
                     exit_code = 2
         else:
             n_required = len(ALL_OFFSET_NAMES)
@@ -4440,14 +4457,14 @@ def main():
         if quiet:
             sys.stdout = _stdout_main
             if fmt == 'pe' and results:
-                patcher_count = sum(1 for k in PATCHER_OFFSET_NAMES if k in results)
+                patcher_count, n_q = count_patcher_offsets_found(results)
                 xval = _cross_validate(results, adj, data, tiers_used=tiers_used)
-                print("  {} / 17  (required for Discord_voice_node_patcher.ps1)".format(patcher_count))
+                print("  {} / {}  (required for Discord_voice_node_patcher.ps1)".format(patcher_count, n_q))
                 print("  x86_64 discovered: {} offsets".format(len(results)))
-                if patcher_count == 17:
-                    print("  [OK] ALL 17 WINDOWS PATCHER OFFSETS FOUND")
+                if patcher_count == n_q:
+                    print("  [OK] ALL {} WINDOWS PATCHER OFFSETS FOUND".format(n_q))
                 else:
-                    print("  *** PARTIAL: {}/17 ***".format(patcher_count))
+                    print("  *** PARTIAL: {}/{} ***".format(patcher_count, n_q))
                 print("  Cross-validation: clean" if not xval else "  Cross-validation: {} issue(s)".format(len(xval)))
                 win_block = format_windows_patcher_block(results, bin_info, file_path, file_size)
                 if win_block:

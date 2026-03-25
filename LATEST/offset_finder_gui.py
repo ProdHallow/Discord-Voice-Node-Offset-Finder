@@ -7,7 +7,7 @@ Matches the Stereo Installer dark theme.
 Works with finder v5.1+: 17 offsets (same set as Windows/Linux/macOS patchers).
 Copy Block copies the Windows paste block for PE, or Linux/macOS block when applicable.
 
-Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher
+Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher | Crue | Geeko
 """
 
 import os
@@ -15,16 +15,21 @@ import sys
 import shutil
 import atexit
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext
 from datetime import datetime
 from pathlib import Path
 import importlib.util
 import io
 
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, scrolledtext
+except ImportError:  # pragma: no cover
+    tk = None  # type: ignore[assignment, misc]
+    ttk = filedialog = scrolledtext = None  # type: ignore[assignment]
+
 sys.dont_write_bytecode = True
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 SCRIPT_DIR = Path(__file__).parent
 # Windows debug: no bash needed; finder runs natively on PE. Set OFFSET_FINDER_DEBUG=1 for verbose log.
 DEBUG_MODE = os.environ.get("OFFSET_FINDER_DEBUG", "").lower() in ("1", "true", "yes") or "--debug" in sys.argv
@@ -36,6 +41,29 @@ def _cleanup_pycache():
 
 
 atexit.register(_cleanup_pycache)
+
+
+def _hub_scripts_cache_dir():
+    """If Stereo Hub synced the finder, it may live here (same layout as discord_stereo_hub_gui.hub_scripts_dir)."""
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+            p = Path(base) / "DiscordStereoHub" / "scripts"
+        else:
+            p = Path.home() / ".cache" / "DiscordStereoHub" / "scripts"
+        return p if p.is_dir() else None
+    except Exception:
+        return None
+
+
+def _finder_script_search_dirs():
+    """Prefer OFFSET FINDER/LATEST; also Stereo Hub cache when manifest synced the .py there."""
+    dirs = [SCRIPT_DIR]
+    hub_scripts = _hub_scripts_cache_dir()
+    if hub_scripts and hub_scripts != SCRIPT_DIR:
+        dirs.append(hub_scripts)
+    return dirs
+
 
 BG           = "#1e1e1e"
 BG_LIGHT     = "#2d2d2d"
@@ -102,7 +130,7 @@ class OffsetFinderGUI:
 
         tk.Label(title_frame, text="Offset Finder", font=("Segoe UI", 20, "bold"),
                  bg=BG, fg=FG_ACCENT).pack()
-        tk.Label(title_frame, text="Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher",
+        tk.Label(title_frame, text="Made by: Oracle | Shaun | Hallow | Ascend | Sentry | Sikimzo | Cypher | Crue | Geeko",
                  font=("Segoe UI", 8), bg=BG, fg=FG_DIM).pack()
         tk.Label(title_frame, text=f"v{VERSION}",
                  font=("Segoe UI", 8), bg=BG, fg=FG_DIM).pack()
@@ -322,17 +350,23 @@ class OffsetFinderGUI:
 
     def _load_finder(self):
         finder_path = None
-        for f in sorted(SCRIPT_DIR.glob("*.py"), reverse=True):
-            if f.name == Path(__file__).name:
+        for search_dir in _finder_script_search_dirs():
+            if not search_dir.is_dir():
                 continue
-            try:
-                text = f.read_text(encoding="utf-8", errors="ignore")[:4000]
-                if "Discord Voice Node Offset Finder" in text or \
-                   ("SIGNATURES" in text and "VERSION" in text):
-                    finder_path = f
-                    break
-            except Exception:
-                continue
+            for f in sorted(search_dir.glob("*.py"), reverse=True):
+                if f.name == Path(__file__).name:
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8", errors="ignore")[:4000]
+                    if "Discord Voice Node Offset Finder" in text or (
+                        "SIGNATURES" in text and "VERSION" in text
+                    ):
+                        finder_path = f
+                        break
+                except Exception:
+                    continue
+            if finder_path:
+                break
 
         if finder_path and finder_path.exists():
             spec = importlib.util.spec_from_file_location("offset_finder", finder_path)
@@ -340,12 +374,12 @@ class OffsetFinderGUI:
             try:
                 spec.loader.exec_module(self.finder_module)
                 ver = getattr(self.finder_module, "VERSION", "?")
-                self.status_var.set(f"Loaded: {finder_path.name} (v{ver})")
+                self.status_var.set(f"Loaded: {finder_path.name} (v{ver}) from {finder_path.parent.name}/")
             except Exception as e:
                 self.status_var.set(f"Error loading finder: {e}")
                 self.finder_module = None
         else:
-            self.status_var.set("Warning: no offset finder script found in same directory")
+            self.status_var.set("Warning: no offset finder .py (place v5 next to this GUI or sync via Stereo Hub)")
 
     def _run_finder(self):
         if self.running:
@@ -362,7 +396,10 @@ class OffsetFinderGUI:
         self._load_finder()
         if self.finder_module is None:
             self._append_output("  [ERROR] Offset finder script not loaded.\n", "fail")
-            self._append_output("  Place the offset finder .py script in the same folder as this GUI.\n", "info")
+            self._append_output(
+                "  Put discord_voice_node_offset_finder_v5.py in OFFSET FINDER/LATEST or sync it via Stereo Hub / manifest.\n",
+                "info",
+            )
             return
 
         self.running = True
@@ -427,12 +464,18 @@ class OffsetFinderGUI:
                         tag = "header"
                     self._append_output_safe(line + "\n", tag)
 
-            total = 18
             found = len(results)
             patcher_names = getattr(mod, "PATCHER_OFFSET_NAMES", None)
+            patcher_names_u = list(dict.fromkeys(patcher_names)) if patcher_names else []
             is_pe = fmt == "pe"
-            patcher_count = sum(1 for k in patcher_names if k in results) if (is_pe and patcher_names) else found
-            n_patcher = len(patcher_names) if patcher_names else 17
+            if is_pe and patcher_names_u and hasattr(mod, "count_patcher_offsets_found"):
+                patcher_count, n_patcher = mod.count_patcher_offsets_found(results)
+            elif is_pe and patcher_names_u:
+                patcher_count = sum(1 for k in patcher_names_u if k in results)
+                n_patcher = len(patcher_names_u)
+            else:
+                patcher_count = found
+                n_patcher = len(patcher_names_u) if patcher_names_u else 17
             n_expected = n_patcher
 
             try:
@@ -444,7 +487,7 @@ class OffsetFinderGUI:
                 self._append_output_safe(f"\n  {'=' * 55}\n", "header")
                 self._append_output_safe("  RESULTS SUMMARY\n", "header")
                 self._append_output_safe(f"  {'=' * 55}\n", "header")
-                if is_pe and patcher_names:
+                if is_pe and patcher_names_u:
                     self._append_output_safe(
                         f"  Windows patcher:   {patcher_count} / {n_patcher}  (required for Discord_voice_node_patcher.ps1)\n", "info")
                     self._append_output_safe(
@@ -527,12 +570,16 @@ class OffsetFinderGUI:
                     self._append_output_safe(line + "\n", tag)
 
             if not verbose and is_pe:
-                self._append_output_safe(f"  {patcher_count} / 17  (required for Discord_voice_node_patcher.ps1)\n", "info")
+                self._append_output_safe(
+                    f"  {patcher_count} / {n_patcher}  (required for Discord_voice_node_patcher.ps1)\n", "info"
+                )
                 self._append_output_safe(f"  x86_64 discovered: {found} offsets\n", "info")
-                if patcher_count == 17:
-                    self._append_output_safe("  [OK] ALL 17 WINDOWS PATCHER OFFSETS FOUND\n", "success")
+                if patcher_count == n_patcher:
+                    self._append_output_safe(
+                        f"  [OK] ALL {n_patcher} WINDOWS PATCHER OFFSETS FOUND\n", "success"
+                    )
                 else:
-                    self._append_output_safe(f"  *** PARTIAL: {patcher_count}/17 ***\n", "warn")
+                    self._append_output_safe(f"  *** PARTIAL: {patcher_count}/{n_patcher} ***\n", "warn")
                 self._append_output_safe("  Cross-validation: clean\n" if not xval else f"  Cross-validation: {len(xval)} issue(s)\n", "pass" if not xval else "warn")
 
             if not verbose and not is_pe:
@@ -638,7 +685,7 @@ class OffsetFinderGUI:
                 except Exception as e:
                     self._append_output_safe(f"\n  JSON save error: {e}\n", "warn")
 
-            if is_pe and patcher_names:
+            if is_pe and patcher_names_u:
                 status_msg = f"Done - Windows patcher: {patcher_count}/{n_patcher} | x86_64: {found}/{n_expected}"
             else:
                 status_msg = f"Done - x86_64: {found}/{n_expected}"
@@ -682,6 +729,16 @@ class OffsetFinderGUI:
 
 
 def main():
+    if tk is None:
+        print("Offset Finder requires Tkinter.", file=sys.stderr)
+        if sys.platform.startswith("linux"):
+            print("  sudo apt install python3-tk", file=sys.stderr)
+        elif sys.platform == "darwin":
+            print("  Use python.org Python or: brew install python-tk", file=sys.stderr)
+        else:
+            print("  Reinstall Python with Tcl/Tk.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
