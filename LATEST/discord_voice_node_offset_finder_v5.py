@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discord Voice Node Offset Finder v5.1 — PE/ELF/Mach-O offset discovery (17 patcher offsets)."""
+"""Discord Voice Node Offset Finder v5.1.1 — PE/ELF/Mach-O offset discovery (17 patcher offsets)."""
 
 import sys
 import os
@@ -20,7 +20,7 @@ try:
 except ImportError:
     VIZ_AVAILABLE = False
 
-VERSION = "5.1"
+VERSION = "5.1.1"
 
 TARGET_BITRATE_BPS = 384000
 _BITRATE_LE = TARGET_BITRATE_BPS.to_bytes(4, "little")
@@ -3756,15 +3756,18 @@ def format_linux_patcher_block(results, bin_info, file_path, file_size):
 def format_macos_patcher_block(results, bin_info, file_path, file_size,
                                arm64_results=None, arm64_info=None, arm64_adj=None):
     """Generate macOS patcher offset block for copy-paste into discord_voice_patcher_macos.sh.
-    Uses file offsets; for fat binary, offsets are fat_offset + slice offset.
-    When arm64 results are provided, includes both x86_64 and arm64 offset blocks."""
+
+    Emits absolute file offsets in the on-disk blob (thin or fat universal). For each slice,
+    file_offset_adjustment already incorporates the slice base (see _parse_macho_slice:
+    raw_offset = s_offset + base_offset, adj = s_addr - raw_offset), so
+    config_va - adj is the correct offset from the start of the file — do not add fat_offset again.
+    """
     if not bin_info or not file_path or file_size is None:
         return None
     fmt = bin_info.get('format', 'raw')
     if fmt != 'macho':
         return None
     adj = bin_info.get('file_offset_adjustment', 0)
-    fat_offset = bin_info.get('fat_offset', 0)
     md5 = _md5_file_hex(file_path, lower=True)
     ordered = _all_offset_names()
     n_expected = len(ordered)
@@ -3781,16 +3784,14 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size,
     lines.append("declare -A OFFSETS=(")
     for name in ordered:
         if name in results:
-            slice_off = results[name] - adj
-            file_off = fat_offset + slice_off
-            lines.append(f"    [{name}]=0x{file_off:X}")
+            abs_file_off = results[name] - adj
+            lines.append(f"    [{name}]=0x{abs_file_off:X}")
         else:
             lines.append(f"    [{name}]=0x0")
     lines.append(")")
 
     if arm64_results and arm64_info:
         a64_adj = arm64_adj if arm64_adj is not None else arm64_info.get('file_offset_adjustment', 0)
-        a64_fat = arm64_info.get('fat_offset', 0)
         a64_found = sum(1 for n in ordered if n in arm64_results)
 
         lines.append("")
@@ -3798,9 +3799,8 @@ def format_macos_patcher_block(results, bin_info, file_path, file_size,
         lines.append("declare -A ARM64_OFFSETS=(")
         for name in ordered:
             if name in arm64_results:
-                slice_off = arm64_results[name] - a64_adj
-                file_off = a64_fat + slice_off
-                lines.append(f"    [{name}]=0x{file_off:X}")
+                abs_file_off = arm64_results[name] - a64_adj
+                lines.append(f"    [{name}]=0x{abs_file_off:X}")
             else:
                 lines.append(f"    [{name}]=0x0")
         lines.append(")")
@@ -3843,16 +3843,14 @@ def format_json(results, bin_info, file_path, file_size, adj, tiers_used,
 
     if arm64_results and arm64_info:
         a64_adj = arm64_adj if arm64_adj is not None else arm64_info.get('file_offset_adjustment', 0)
-        a64_fat = arm64_info.get('fat_offset', 0)
         a64_offsets = {}
         a64_file_offsets = {}
         a64_tiers_out = {}
         for name in sorted(arm64_results.keys()):
             if name in ALLOWED_OFFSET_NAMES:
-                file_off = arm64_results[name] - a64_adj
-                fat_off = a64_fat + file_off
+                abs_file_off = arm64_results[name] - a64_adj
                 a64_offsets[name] = hex(arm64_results[name])
-                a64_file_offsets[name] = hex(fat_off)
+                a64_file_offsets[name] = hex(abs_file_off)
                 if arm64_tiers and name in arm64_tiers:
                     a64_tiers_out[name] = arm64_tiers[name]
         out["arm64_offsets"] = a64_offsets
