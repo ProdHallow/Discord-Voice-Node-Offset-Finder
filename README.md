@@ -11,6 +11,9 @@ Automated discovery of patch sites inside Discord’s native voice module (`disc
 
 ---
 
+# ⚠️ ATTENTION!!! I WILL BE MERGING EVERY DISCORD AUDIO RELATED REPO TO [Discord Audio Collective](https://github.com/ProdHallow/Discord-Stereo-Windows-MacOS-Linux)
+---
+
 ## 👥 Credits
 
 **Research, signatures, and patch methodology:** ProdHallow, Cypher, Shaun, Oracle, Crue, Geeko  
